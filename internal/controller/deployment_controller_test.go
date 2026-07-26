@@ -120,6 +120,7 @@ var _ = Describe("Deployment Controller", func() {
 		Expect(pod.Spec.Containers[0].Image).To(Equal(newImage))
 		Expect(pod.UID).To(Equal(uid))
 		Expect(pod.Status.PodIP).To(Equal("10.0.0.42"))
+		reconcileDeployment(ctx, key, deploymentReconciler, 1)
 
 		var native appsv1.Deployment
 		Expect(k8sClient.Get(ctx, key, &native)).To(MatchError(ContainSubstring("not found")))
@@ -128,6 +129,7 @@ var _ = Describe("Deployment Controller", func() {
 		workload = currentDeployment(ctx, key)
 		scale := &autoscalingv1.Scale{}
 		Expect(k8sClient.SubResource("scale").Get(ctx, workload, scale)).To(Succeed())
+		Expect(scale.Status.Selector).To(Equal(appLabel + "=" + name))
 		scale.Spec.Replicas = 3
 		Expect(k8sClient.SubResource("scale").Update(
 			ctx,
@@ -154,7 +156,38 @@ var _ = Describe("Deployment Controller", func() {
 		Expect(replicaSets[0].Labels[structuralRevisionLabel]).
 			NotTo(Equal(replicaSets[1].Labels[structuralRevisionLabel]))
 	})
+
+	It("does not trust stale ReplicaSet image progress", func() {
+		replicaSet := &appsv1alpha1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Generation: 2},
+			Spec: appsv1alpha1.ReplicaSetSpec{ReplicaSetSpec: appsv1.ReplicaSetSpec{
+				Template: podTemplate(name, newImage),
+			}},
+			Status: appsv1alpha1.ReplicaSetStatus{
+				ReplicaSetStatus: appsv1.ReplicaSetStatus{ObservedGeneration: 1},
+				InPlace: &appsv1alpha1.InPlaceUpdateStatus{
+					Revision:             imageRevisionPointer(newImage),
+					UpdatedReplicas:      1,
+					ReadyUpdatedReplicas: 1,
+				},
+			},
+		}
+
+		progress := observedInPlaceStatus(replicaSet)
+		Expect(progress.Revision).To(Equal(imageRevision(&replicaSet.Spec.Template)))
+		Expect(progress.UpdatedReplicas).To(BeZero())
+		Expect(progress.ReadyUpdatedReplicas).To(BeZero())
+
+		replicaSet.Status.ObservedGeneration = replicaSet.Generation
+		replicaSet.Status.InPlace.Revision = imageRevision(&replicaSet.Spec.Template)
+		Expect(observedInPlaceStatus(replicaSet).UpdatedReplicas).To(Equal(int32(1)))
+	})
 })
+
+func imageRevisionPointer(image string) string {
+	template := podTemplate("revision", image)
+	return imageRevision(&template)
+}
 
 func reconcileDeployment(
 	ctx context.Context,

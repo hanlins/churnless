@@ -31,11 +31,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
+	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
 const inPlaceParallelismAnnotation = "apps.churnless.io/in-place-parallelism"
@@ -43,7 +45,8 @@ const inPlaceParallelismAnnotation = "apps.churnless.io/in-place-parallelism"
 // ReplicaSetReconciler reconciles a ReplicaSet.
 type ReplicaSetReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
@@ -127,7 +130,7 @@ func (r *ReplicaSetReconciler) removeLegacyShadow(
 	workload *appsv1alpha1.ReplicaSet,
 ) (bool, error) {
 	var shadow appsv1.ReplicaSet
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workload), &shadow); apierrors.IsNotFound(err) {
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(workload), &shadow); apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
@@ -147,7 +150,7 @@ func (r *ReplicaSetReconciler) claimPods(
 	selector labels.Selector,
 ) ([]corev1.Pod, bool, error) {
 	var list corev1.PodList
-	if err := r.List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+	if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
 		return nil, false, err
 	}
 
@@ -165,7 +168,11 @@ func (r *ReplicaSetReconciler) claimPods(
 					return ref.Controller != nil && *ref.Controller && ref.UID == workload.UID
 				},
 			)
-			if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			if err := r.Patch(
+				ctx,
+				pod,
+				client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+			); err != nil {
 				return nil, false, fmt.Errorf("release Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 			}
 			return nil, true, nil
@@ -174,17 +181,47 @@ func (r *ReplicaSetReconciler) claimPods(
 		case !matches || metav1.GetControllerOf(pod) != nil || !workload.DeletionTimestamp.IsZero():
 			continue
 		default:
+			if err := r.canAdopt(ctx, workload); err != nil {
+				return nil, false, err
+			}
 			before := pod.DeepCopy()
 			if err := controllerutil.SetControllerReference(workload, pod, r.Scheme); err != nil {
 				return nil, false, err
 			}
-			if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			if err := r.Patch(
+				ctx,
+				pod,
+				client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+			); err != nil {
 				return nil, false, fmt.Errorf("adopt Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 			}
 			return nil, true, nil
 		}
 	}
 	return claimed, false, nil
+}
+
+func (r *ReplicaSetReconciler) canAdopt(
+	ctx context.Context,
+	workload *appsv1alpha1.ReplicaSet,
+) error {
+	var fresh appsv1alpha1.ReplicaSet
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(workload), &fresh); err != nil {
+		return fmt.Errorf("recheck ReplicaSet before adoption: %w", err)
+	}
+	if fresh.UID != workload.UID {
+		return fmt.Errorf(
+			"ReplicaSet %s/%s was replaced: got UID %s, expected %s",
+			workload.Namespace,
+			workload.Name,
+			fresh.UID,
+			workload.UID,
+		)
+	}
+	if !fresh.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("ReplicaSet %s/%s is being deleted", workload.Namespace, workload.Name)
+	}
+	return nil
 }
 
 func activeReplicaSetPods(pods []corev1.Pod) (active []corev1.Pod, terminating int32) {
@@ -211,14 +248,35 @@ func (r *ReplicaSetReconciler) reconcileReplicas(
 	diff := int(desiredReplicas(workload.Spec.Replicas)) - len(pods)
 	switch {
 	case diff > 0:
-		for range diff {
-			if err := r.createPod(ctx, workload); err != nil {
-				return false, err
-			}
+		diff = min(diff, kubecompat.BurstReplicas)
+		created, err := kubecompat.SlowStartBatch(
+			diff,
+			kubecompat.SlowStartInitialBatchSize,
+			func() error {
+				return r.createPod(ctx, workload)
+			},
+		)
+		if err != nil {
+			return created > 0, err
 		}
 		return true, nil
 	case diff < 0:
-		slices.SortStableFunc(pods, compareScaleDownPods)
+		diff = max(diff, -kubecompat.BurstReplicas)
+		related, err := r.relatedPods(ctx, workload)
+		if err != nil {
+			return false, err
+		}
+		ranks := podRanks(related)
+		now := metav1.Now()
+		slices.SortStableFunc(pods, func(left, right corev1.Pod) int {
+			return kubecompat.ComparePodsForDeletion(
+				&left,
+				&right,
+				ranks[podKey(&left)],
+				ranks[podKey(&right)],
+				now,
+			)
+		})
 		for i := range -diff {
 			if err := r.Delete(ctx, &pods[i]); client.IgnoreNotFound(err) != nil {
 				return false, fmt.Errorf("delete Pod %s/%s: %w", pods[i].Namespace, pods[i].Name, err)
@@ -228,6 +286,70 @@ func (r *ReplicaSetReconciler) reconcileReplicas(
 	default:
 		return false, nil
 	}
+}
+
+func (r *ReplicaSetReconciler) relatedPods(
+	ctx context.Context,
+	workload *appsv1alpha1.ReplicaSet,
+) ([]corev1.Pod, error) {
+	relatedReplicaSets := map[types.UID]struct{}{workload.UID: {}}
+	if owner := metav1.GetControllerOf(workload); owner != nil &&
+		owner.APIVersion == appsv1alpha1.GroupVersion.String() &&
+		owner.Kind == "Deployment" {
+		var replicaSets appsv1alpha1.ReplicaSetList
+		if err := r.reader().List(
+			ctx,
+			&replicaSets,
+			client.InNamespace(workload.Namespace),
+		); err != nil {
+			return nil, err
+		}
+		for i := range replicaSets.Items {
+			replicaSetOwner := metav1.GetControllerOf(&replicaSets.Items[i])
+			if replicaSetOwner != nil && replicaSetOwner.UID == owner.UID {
+				relatedReplicaSets[replicaSets.Items[i].UID] = struct{}{}
+			}
+		}
+	}
+
+	var list corev1.PodList
+	if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+		return nil, err
+	}
+	related := make([]corev1.Pod, 0, len(list.Items))
+	for i := range list.Items {
+		pod := &list.Items[i]
+		owner := metav1.GetControllerOf(pod)
+		if owner == nil {
+			continue
+		}
+		if _, ok := relatedReplicaSets[owner.UID]; !ok {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed ||
+			!pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		related = append(related, *pod)
+	}
+	return related, nil
+}
+
+func podRanks(pods []corev1.Pod) map[string]int {
+	onNode := make(map[string]int)
+	for i := range pods {
+		onNode[pods[i].Spec.NodeName]++
+	}
+	ranks := make(map[string]int, len(pods))
+	for i := range pods {
+		ranks[podKey(&pods[i])] = onNode[pods[i].Spec.NodeName]
+	}
+	return ranks
+}
+
+func podKey(pod *corev1.Pod) string {
+	return pod.Namespace + "/" + pod.Name
 }
 
 func (r *ReplicaSetReconciler) createPod(
@@ -257,22 +379,6 @@ func (r *ReplicaSetReconciler) createPod(
 		return fmt.Errorf("create Pod for ReplicaSet %s/%s: %w", workload.Namespace, workload.Name, err)
 	}
 	return nil
-}
-
-func compareScaleDownPods(left, right corev1.Pod) int {
-	leftReady, rightReady := isPodReady(&left), isPodReady(&right)
-	switch {
-	case leftReady != rightReady && !leftReady:
-		return -1
-	case leftReady != rightReady:
-		return 1
-	case left.CreationTimestamp.After(right.CreationTimestamp.Time):
-		return -1
-	case right.CreationTimestamp.After(left.CreationTimestamp.Time):
-		return 1
-	default:
-		return 0
-	}
 }
 
 func replicaSetParallelism(workload *appsv1alpha1.ReplicaSet) int {
@@ -332,7 +438,7 @@ func fullyLabeledReplicas(pods []corev1.Pod, template *corev1.PodTemplateSpec) i
 func readyReplicas(pods []corev1.Pod) int32 {
 	var count int32
 	for i := range pods {
-		if isPodReady(&pods[i]) {
+		if kubecompat.IsPodReady(&pods[i]) {
 			count++
 		}
 	}
@@ -341,17 +447,10 @@ func readyReplicas(pods []corev1.Pod) int32 {
 
 func availableReplicas(pods []corev1.Pod, minReadySeconds int32) int32 {
 	var count int32
-	now := time.Now()
+	now := metav1.Now()
 	for i := range pods {
-		for _, condition := range pods[i].Status.Conditions {
-			if condition.Type != corev1.PodReady || condition.Status != corev1.ConditionTrue {
-				continue
-			}
-			if minReadySeconds == 0 ||
-				condition.LastTransitionTime.Add(time.Duration(minReadySeconds)*time.Second).Before(now) {
-				count++
-			}
-			break
+		if kubecompat.IsPodAvailable(&pods[i], minReadySeconds, now) {
+			count++
 		}
 	}
 	return count
@@ -359,9 +458,19 @@ func availableReplicas(pods []corev1.Pod, minReadySeconds int32) int32 {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ReplicaSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.ReplicaSet{}).
 		Owns(&corev1.Pod{}).
 		Named("replicaset").
 		Complete(r)
+}
+
+func (r *ReplicaSetReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }

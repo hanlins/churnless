@@ -37,6 +37,7 @@ import (
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 	"github.com/hanlins/churnless/internal/controller"
+	webhookv1alpha1 "github.com/hanlins/churnless/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -190,6 +191,14 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "replicaset")
+		os.Exit(1)
+	}
+	if err := webhookv1alpha1.SetupDeploymentWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create webhook", "webhook", "Deployment")
+		os.Exit(1)
+	}
+	if err := webhookv1alpha1.SetupReplicaSetWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create webhook", "webhook", "ReplicaSet")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

@@ -22,14 +22,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
 
+var bearerTokenPattern = regexp.MustCompile(`Bearer [A-Za-z0-9._-]+`)
+
 const (
-	certmanagerVersion = "v1.20.2"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerVersion   = "v1.20.2"
+	certmanagerURLTmpl   = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	metricsServerVersion = "v0.8.1"
+	metricsServerURLTmpl = "https://github.com/kubernetes-sigs/metrics-server/releases/download/%s/components.yaml"
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
@@ -49,7 +54,7 @@ func Run(cmd *exec.Cmd) (string, error) {
 	}
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
-	command := strings.Join(cmd.Args, " ")
+	command := bearerTokenPattern.ReplaceAllString(strings.Join(cmd.Args, " "), "Bearer [REDACTED]")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -131,6 +136,47 @@ func IsCertManagerCRDsInstalled() bool {
 	}
 
 	return false
+}
+
+// InstallMetricsServer installs Metrics Server with the Kind-compatible
+// kubelet TLS setting used by the HPA end-to-end test.
+func InstallMetricsServer() error {
+	url := fmt.Sprintf(metricsServerURLTmpl, metricsServerVersion)
+	if _, err := Run(exec.Command("kubectl", "apply", "-f", url)); err != nil {
+		return err
+	}
+	patch := `[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]`
+	if _, err := Run(exec.Command(
+		"kubectl",
+		"patch",
+		"deployment",
+		"metrics-server",
+		"--namespace",
+		"kube-system",
+		"--type=json",
+		"-p",
+		patch,
+	)); err != nil {
+		return err
+	}
+	_, err := Run(exec.Command(
+		"kubectl",
+		"wait",
+		"deployment/metrics-server",
+		"--namespace",
+		"kube-system",
+		"--for=condition=Available",
+		"--timeout=5m",
+	))
+	return err
+}
+
+// UninstallMetricsServer removes the bundle installed by InstallMetricsServer.
+func UninstallMetricsServer() {
+	url := fmt.Sprintf(metricsServerURLTmpl, metricsServerVersion)
+	if _, err := Run(exec.Command("kubectl", "delete", "-f", url)); err != nil {
+		warnError(err)
+	}
 }
 
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster

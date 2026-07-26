@@ -25,10 +25,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 
 	"github.com/hanlins/churnless/test/utils"
 )
@@ -232,6 +234,42 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
 
+			By("waiting for the webhook service endpoints to be ready")
+			verifyWebhookEndpointsReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpointslices.discovery.k8s.io", "-n", namespace,
+					"-l", "kubernetes.io/service-name=churnless-webhook-service",
+					"-o", "jsonpath={range .items[*]}{range .endpoints[*]}{.addresses[*]}{end}{end}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Webhook endpoints should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Webhook endpoints not yet ready")
+			}
+			Eventually(verifyWebhookEndpointsReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the mutating webhook server is ready")
+			verifyMutatingWebhookReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "mutatingwebhookconfigurations.admissionregistration.k8s.io",
+					"churnless-mutating-webhook-configuration",
+					"-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "MutatingWebhookConfiguration should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Mutating webhook CA bundle not yet injected")
+			}
+			Eventually(verifyMutatingWebhookReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the validating webhook server is ready")
+			verifyValidatingWebhookReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "validatingwebhookconfigurations.admissionregistration.k8s.io",
+					"churnless-validating-webhook-configuration",
+					"-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "ValidatingWebhookConfiguration should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Validating webhook CA bundle not yet injected")
+			}
+			Eventually(verifyValidatingWebhookReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("waiting additional time for webhook server to stabilize")
+			time.Sleep(5 * time.Second)
+
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
 			By("creating the curl-metrics pod to access the metrics endpoint")
@@ -246,7 +284,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
 							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
+								"for i in $(seq 1 30); do curl -sS -k -o /dev/null -w '%%{http_code}' -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
 							],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
@@ -283,7 +321,7 @@ var _ = Describe("Manager", Ordered, func() {
 				metricsOutput, err := getMetricsOutput()
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
 				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
+				g.Expect(metricsOutput).To(ContainSubstring("200"))
 			}
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
 		})
@@ -326,7 +364,7 @@ var _ = Describe("Manager", Ordered, func() {
 				workload,
 				"--type=merge",
 				"-p",
-				fmt.Sprintf(`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","ports":[{"containerPort":80}]}]}}}}`, newImage),
+				fmt.Sprintf(`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","ports":[{"containerPort":80}],"resources":{"requests":{"cpu":"100m"}}}]}}}}`, newImage),
 			)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -376,11 +414,182 @@ var _ = Describe("Manager", Ordered, func() {
 				Expect(scaled[name].UID).To(Equal(previous.UID))
 				Expect(scaled[name].IP).To(Equal(previous.IP))
 			}
+
+			By("letting an HPA scale the custom Deployment through /scale")
+			hpa := fmt.Sprintf(`apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: %s
+spec:
+  scaleTargetRef:
+    apiVersion: apps.churnless.io/v1alpha1
+    kind: Deployment
+    name: %s
+  minReplicas: 1
+  maxReplicas: 3
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 0
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+`, workload, workload)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(hpa)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				cmd := exec.Command("kubectl", "delete", "hpa", workload, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			})
+
+			Eventually(func(g Gomega) {
+				cmd := exec.Command(
+					"kubectl",
+					"get",
+					"deployment.apps.churnless.io",
+					workload,
+					"-o",
+					"jsonpath={.spec.replicas}",
+				)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+			eventuallyDeploymentPods(workload, 1, newImage)
+		})
+
+		It("should match native admission defaults and critical validation", func() {
+			native, err := serverDryRunDeployment("apps/v1", "admission-defaults", true)
+			Expect(err).NotTo(HaveOccurred())
+			churnless, err := serverDryRunDeployment(
+				"apps.churnless.io/v1alpha1",
+				"admission-defaults",
+				true,
+			)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(churnless).To(Equal(native))
+
+			_, nativeErr := serverDryRunDeployment("apps/v1", "admission-invalid", false)
+			_, churnlessErr := serverDryRunDeployment(
+				"apps.churnless.io/v1alpha1",
+				"admission-invalid",
+				false,
+			)
+			Expect(nativeErr).To(HaveOccurred())
+			Expect(churnlessErr).To(HaveOccurred())
+
+			nativeReplicaSet, err := serverDryRunReplicaSet(
+				"apps/v1",
+				"replicaset-admission-defaults",
+			)
+			Expect(err).NotTo(HaveOccurred())
+			churnlessReplicaSet, err := serverDryRunReplicaSet(
+				"apps.churnless.io/v1alpha1",
+				"replicaset-admission-defaults",
+			)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(churnlessReplicaSet).To(Equal(nativeReplicaSet))
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 	})
 })
+
+func serverDryRunDeployment(
+	apiVersion, name string,
+	selectorMatches bool,
+) (appsv1.DeploymentSpec, error) {
+	templateLabel := name
+	if !selectorMatches {
+		templateLabel = "other"
+	}
+	manifest := fmt.Sprintf(`apiVersion: %s
+kind: Deployment
+metadata:
+  name: %s
+spec:
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      volumes:
+      - name: credentials
+        secret:
+          secretName: credentials
+      containers:
+      - name: web
+        image: nginx:1.28-alpine
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+`, apiVersion, name, name, templateLabel)
+	cmd := exec.Command("kubectl", "create", "--dry-run=server", "-f", "-", "-o", "json")
+	cmd.Stdin = strings.NewReader(manifest)
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return appsv1.DeploymentSpec{}, err
+	}
+	var workload struct {
+		Spec appsv1.DeploymentSpec `json:"spec"`
+	}
+	if err := json.Unmarshal([]byte(output), &workload); err != nil {
+		return appsv1.DeploymentSpec{}, err
+	}
+	return workload.Spec, nil
+}
+
+func serverDryRunReplicaSet(apiVersion, name string) (appsv1.ReplicaSetSpec, error) {
+	manifest := fmt.Sprintf(`apiVersion: %s
+kind: ReplicaSet
+metadata:
+  name: %s
+spec:
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      volumes:
+      - name: credentials
+        secret:
+          secretName: credentials
+      containers:
+      - name: web
+        image: nginx:1.28-alpine
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+`, apiVersion, name, name, name)
+	cmd := exec.Command("kubectl", "create", "--dry-run=server", "-f", "-", "-o", "json")
+	cmd.Stdin = strings.NewReader(manifest)
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return appsv1.ReplicaSetSpec{}, err
+	}
+	var workload struct {
+		Spec appsv1.ReplicaSetSpec `json:"spec"`
+	}
+	if err := json.Unmarshal([]byte(output), &workload); err != nil {
+		return appsv1.ReplicaSetSpec{}, err
+	}
+	return workload.Spec, nil
+}
 
 type podIdentity struct {
 	UID string

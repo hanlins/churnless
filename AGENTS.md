@@ -1,5 +1,16 @@
 # churnless - AI Agent Guide
 
+## Project Design
+
+Read [DESIGN.md](DESIGN.md) before changing APIs, controllers, ownership, or
+rollout behavior. It is the canonical human/agent-facing design contract.
+`README.md` is the concise public introduction and must remain consistent with
+the design without duplicating it.
+
+Update `DESIGN.md` in the same change as any architectural or compatibility
+decision. Preserve its ownership and revision invariants unless the task
+explicitly changes the design.
+
 ## Project Structure
 
 **Single-group layout (default):**

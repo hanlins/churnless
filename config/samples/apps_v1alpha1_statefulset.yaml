@@ -1,0 +1,24 @@
+apiVersion: apps.churnless.io/v1alpha1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/name: churnless
+    app.kubernetes.io/managed-by: kustomize
+  name: statefulset-sample
+spec:
+  serviceName: statefulset-sample
+  replicas: 2
+  selector:
+    matchLabels:
+      app: statefulset-sample
+  template:
+    metadata:
+      labels:
+        app: statefulset-sample
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports:
+        - name: http
+          containerPort: 80

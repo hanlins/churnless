@@ -1,0 +1,48 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - apps
+  - apps.churnless.io
+  resources:
+  - deployments
+  - replicasets
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.churnless.io
+  resources:
+  - deployments/finalizers
+  - replicasets/finalizers
+  - statefulsets/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apps.churnless.io
+  resources:
+  - deployments/status
+  - replicasets/status
+  - statefulsets/status
+  verbs:
+  - get
+  - patch
+  - update

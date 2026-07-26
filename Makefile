@@ -16,6 +16,14 @@ endif
 # tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
 
+# Local Kind playground settings.
+KIND_CLUSTER ?= churnless
+KIND_IMAGE ?= example.com/churnless:v0.0.1
+E2E_KIND_CLUSTER ?= churnless-test-e2e
+
+# Build local tools with the same Go toolchain used by this module.
+PROJECT_GO_TOOLCHAIN ?= $(shell go env GOVERSION)
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -69,7 +77,6 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - KUBECTL_KUBERC=true
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= churnless-test-e2e
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -78,21 +85,21 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 		exit 1; \
 	}
 	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+		*"$(E2E_KIND_CLUSTER)"*) \
+			echo "Kind cluster '$(E2E_KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			echo "Creating Kind cluster '$(E2E_KIND_CLUSTER)'..."; \
+			$(KIND) create cluster --name $(E2E_KIND_CLUSTER) ;; \
 	esac
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	KIND=$(KIND) KIND_CLUSTER=$(E2E_KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@$(KIND) delete cluster --name $(E2E_KIND_CLUSTER)
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -105,6 +112,33 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+##@ Local Kind Playground
+
+.PHONY: kind-up
+kind-up: ## Create a Kind cluster and deploy the controller and sample workload.
+	@KIND="$(KIND)" \
+		KUBECTL="$(KUBECTL)" \
+		CONTAINER_TOOL="$(CONTAINER_TOOL)" \
+		KIND_CLUSTER="$(KIND_CLUSTER)" \
+		KIND_IMAGE="$(KIND_IMAGE)" \
+		./hack/kind-up.sh
+
+.PHONY: kind-status
+kind-status: ## Show the controller, custom Deployment/ReplicaSet, and sample Pods.
+	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
+		-n churnless-system get deployment.apps/churnless-controller-manager
+	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
+		get deployment.apps.churnless.io/deployment-sample
+	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
+		get replicasets.apps.churnless.io \
+		-l apps.churnless.io/structural-revision
+	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
+		get pods -l app=deployment-sample -o wide
+
+.PHONY: kind-down
+kind-down: ## Delete the local Kind playground cluster.
+	@"$(KIND)" delete cluster --name "$(KIND_CLUSTER)"
 
 ##@ Build
 
@@ -234,7 +268,8 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 	@test -f .custom-gcl.yml && { \
 		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		GOTOOLCHAIN="$(PROJECT_GO_TOOLCHAIN)" $(GOLANGCI_LINT) custom \
+			--destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
 
@@ -248,7 +283,7 @@ set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
 rm -f "$(1)" ;\
-GOBIN="$(LOCALBIN)" go install $${package} ;\
+GOTOOLCHAIN="$(PROJECT_GO_TOOLCHAIN)" GOBIN="$(LOCALBIN)" go install $${package} ;\
 mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"

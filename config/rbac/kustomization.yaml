@@ -25,9 +25,6 @@ resources:
 - replicaset_admin_role.yaml
 - replicaset_editor_role.yaml
 - replicaset_viewer_role.yaml
-- statefulset_admin_role.yaml
-- statefulset_editor_role.yaml
-- statefulset_viewer_role.yaml
 - deployment_admin_role.yaml
 - deployment_editor_role.yaml
 - deployment_viewer_role.yaml

@@ -185,13 +185,6 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "deployment")
 		os.Exit(1)
 	}
-	if err := (&controller.StatefulSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "statefulset")
-		os.Exit(1)
-	}
 	if err := (&controller.ReplicaSetReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

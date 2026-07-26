@@ -22,30 +22,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/distribution/reference"
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 )
 
-const (
-	ownerKindAnnotation = "apps.churnless.io/owner-kind"
-	ownerNameAnnotation = "apps.churnless.io/owner-name"
-	ownerUIDLabel       = "apps.churnless.io/owner-uid"
-	revisionAnnotation  = "apps.churnless.io/image-revision"
-)
+const revisionAnnotation = "apps.churnless.io/image-revision"
 
 type podProgress struct {
 	Revision string
@@ -87,31 +76,12 @@ func imageRevision(template *corev1.PodTemplateSpec) string {
 	return fmt.Sprintf("%x", sum[:8])
 }
 
-func injectOwnership(
-	template *corev1.PodTemplateSpec,
-	owner client.Object,
-	kind string,
-) {
-	if template.Labels == nil {
-		template.Labels = map[string]string{}
-	}
-	if template.Annotations == nil {
-		template.Annotations = map[string]string{}
-	}
-	template.Labels[ownerUIDLabel] = string(owner.GetUID())
-	template.Annotations[ownerKindAnnotation] = kind
-	template.Annotations[ownerNameAnnotation] = owner.GetName()
-	template.Annotations[revisionAnnotation] = imageRevision(template)
-}
-
 func cleanTemplate(template *corev1.PodTemplateSpec) *corev1.PodTemplateSpec {
 	clean := template.DeepCopy()
-	delete(clean.Labels, ownerUIDLabel)
+	delete(clean.Labels, structuralRevisionLabel)
 	if len(clean.Labels) == 0 {
 		clean.Labels = nil
 	}
-	delete(clean.Annotations, ownerKindAnnotation)
-	delete(clean.Annotations, ownerNameAnnotation)
 	delete(clean.Annotations, revisionAnnotation)
 	if len(clean.Annotations) == 0 {
 		clean.Annotations = nil
@@ -126,68 +96,6 @@ func clearImages(template *corev1.PodTemplateSpec) {
 	for i := range template.Spec.Containers {
 		template.Spec.Containers[i].Image = ""
 	}
-}
-
-func templatesEqualExceptImages(current, desired *corev1.PodTemplateSpec) bool {
-	left := cleanTemplate(current)
-	right := cleanTemplate(desired)
-	clearImages(left)
-	clearImages(right)
-	return apiequality.Semantic.DeepEqual(left, right)
-}
-
-func imagesEqual(current, desired *corev1.PodTemplateSpec) bool {
-	return containerImagesEqual(current.Spec.InitContainers, desired.Spec.InitContainers) &&
-		containerImagesEqual(current.Spec.Containers, desired.Spec.Containers)
-}
-
-func containerImagesEqual(current, desired []corev1.Container) bool {
-	if len(current) != len(desired) {
-		return false
-	}
-	for i := range desired {
-		if current[i].Name != desired[i].Name || current[i].Image != desired[i].Image {
-			return false
-		}
-	}
-	return true
-}
-
-func prepareShadowTemplate(
-	current, desired *corev1.PodTemplateSpec,
-	owner client.Object,
-	kind string,
-	preserveImages bool,
-) *corev1.PodTemplateSpec {
-	if preserveImages && templatesEqualExceptImages(current, desired) {
-		return current.DeepCopy()
-	}
-	result := desired.DeepCopy()
-	injectOwnership(result, owner, kind)
-	return result
-}
-
-func listOwnedPods(
-	ctx context.Context,
-	c client.Client,
-	owner client.Object,
-) ([]corev1.Pod, error) {
-	var list corev1.PodList
-	if err := c.List(
-		ctx,
-		&list,
-		client.InNamespace(owner.GetNamespace()),
-		client.MatchingLabels{ownerUIDLabel: string(owner.GetUID())},
-	); err != nil {
-		return nil, err
-	}
-	pods := make([]corev1.Pod, 0, len(list.Items))
-	for i := range list.Items {
-		if list.Items[i].DeletionTimestamp.IsZero() {
-			pods = append(pods, list.Items[i])
-		}
-	}
-	return pods, nil
 }
 
 func calculateProgress(
@@ -358,51 +266,12 @@ func allPods(_ corev1.Pod) bool {
 	return true
 }
 
-func statefulSetEligible(partition int32) func(corev1.Pod) bool {
-	return func(pod corev1.Pod) bool {
-		ordinal, err := podOrdinal(pod.Name)
-		return err == nil && int32(ordinal) >= partition
-	}
-}
-
-func statefulSetOrder(left, right corev1.Pod) bool {
-	leftOrdinal, leftErr := podOrdinal(left.Name)
-	rightOrdinal, rightErr := podOrdinal(right.Name)
-	if leftErr != nil || rightErr != nil {
-		return left.Name > right.Name
-	}
-	return leftOrdinal > rightOrdinal
-}
-
-func podOrdinal(name string) (int64, error) {
-	index := strings.LastIndexByte(name, '-')
-	if index < 0 {
-		return 0, fmt.Errorf("pod name %q has no ordinal", name)
-	}
-	return strconv.ParseInt(name[index+1:], 10, 32)
-}
-
 func inPlaceStatus(progress podProgress) *appsv1alpha1.InPlaceUpdateStatus {
 	return &appsv1alpha1.InPlaceUpdateStatus{
 		Revision:             progress.Revision,
 		UpdatedReplicas:      progress.Updated,
 		ReadyUpdatedReplicas: progress.Ready,
 	}
-}
-
-func podWatch(kind string) handler.EventHandler {
-	return handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
-		if object.GetAnnotations()[ownerKindAnnotation] != kind {
-			return nil
-		}
-		name := object.GetAnnotations()[ownerNameAnnotation]
-		if name == "" {
-			return nil
-		}
-		return []reconcile.Request{{
-			NamespacedName: types.NamespacedName{Namespace: object.GetNamespace(), Name: name},
-		}}
-	})
 }
 
 func requeueWhileUpdating(progress podProgress) ctrl.Result {

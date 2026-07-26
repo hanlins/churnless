@@ -9,17 +9,27 @@ rules:
   resources:
   - pods
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch
   - watch
 - apiGroups:
   - apps
+  resources:
+  - deployments
+  - replicasets
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps.churnless.io
   resources:
   - deployments
   - replicasets
-  - statefulsets
   verbs:
   - create
   - delete
@@ -33,7 +43,6 @@ rules:
   resources:
   - deployments/finalizers
   - replicasets/finalizers
-  - statefulsets/finalizers
   verbs:
   - update
 - apiGroups:
@@ -41,7 +50,6 @@ rules:
   resources:
   - deployments/status
   - replicasets/status
-  - statefulsets/status
   verbs:
   - get
   - patch

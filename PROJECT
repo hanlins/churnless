@@ -24,15 +24,6 @@ resources:
   controller: true
   domain: churnless.io
   group: apps
-  kind: StatefulSet
-  path: github.com/hanlins/churnless/api/v1alpha1
-  version: v1alpha1
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: churnless.io
-  group: apps
   kind: ReplicaSet
   path: github.com/hanlins/churnless/api/v1alpha1
   version: v1alpha1

@@ -3,7 +3,6 @@
 # It should be run by config/default
 resources:
 - bases/apps.churnless.io_deployments.yaml
-- bases/apps.churnless.io_statefulsets.yaml
 - bases/apps.churnless.io_replicasets.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 

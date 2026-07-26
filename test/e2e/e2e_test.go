@@ -314,17 +314,9 @@ var _ = Describe("Manager", Ordered, func() {
 			)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			cmd = exec.Command(
-				"kubectl",
-				"rollout",
-				"status",
-				"deployment.apps/"+workload,
-				"--timeout=5m",
-			)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
 
 			before := eventuallyDeploymentPods(workload, 2, oldImage)
+			replicaSetBefore := eventuallyDeploymentReplicaSet(workload, oldImage)
 
 			By("changing only the image")
 			cmd = exec.Command(
@@ -339,6 +331,7 @@ var _ = Describe("Manager", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			after := eventuallyDeploymentPods(workload, 2, newImage)
+			replicaSetAfter := eventuallyDeploymentReplicaSet(workload, newImage)
 
 			for name, previous := range before {
 				current, ok := after[name]
@@ -346,17 +339,28 @@ var _ = Describe("Manager", Ordered, func() {
 				Expect(current.UID).To(Equal(previous.UID), "Pod %s UID changed", name)
 				Expect(current.IP).To(Equal(previous.IP), "Pod %s IP changed", name)
 			}
+			Expect(replicaSetAfter.Name).To(Equal(replicaSetBefore.Name))
+			Expect(replicaSetAfter.UID).To(Equal(replicaSetBefore.UID))
 			cmd = exec.Command(
 				"kubectl",
 				"get",
 				"deployment.apps",
 				workload,
+			)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "a native shadow Deployment must not exist")
+			cmd = exec.Command(
+				"kubectl",
+				"get",
+				"replicasets.apps",
+				"-l",
+				"app="+workload,
 				"-o",
-				"jsonpath={.spec.template.spec.containers[0].image}",
+				"jsonpath={.items[*].metadata.name}",
 			)
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal(oldImage), "native template update would replace the Pods")
+			Expect(output).To(BeEmpty(), "a native shadow ReplicaSet must not exist")
 
 			By("using the standard scale subresource that HPA uses")
 			cmd = exec.Command(
@@ -383,6 +387,64 @@ type podIdentity struct {
 	IP  string
 }
 
+type replicaSetIdentity struct {
+	Name string
+	UID  string
+}
+
+func eventuallyDeploymentReplicaSet(workload, image string) replicaSetIdentity {
+	var result replicaSetIdentity
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"replicasets.apps.churnless.io",
+			"-o",
+			"json",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var list struct {
+			Items []struct {
+				Metadata struct {
+					Name            string `json:"name"`
+					UID             string `json:"uid"`
+					OwnerReferences []struct {
+						Kind string `json:"kind"`
+						Name string `json:"name"`
+					} `json:"ownerReferences"`
+				} `json:"metadata"`
+				Spec struct {
+					Template struct {
+						Spec struct {
+							Containers []struct {
+								Image string `json:"image"`
+							} `json:"containers"`
+						} `json:"spec"`
+					} `json:"template"`
+				} `json:"spec"`
+			} `json:"items"`
+		}
+		g.Expect(json.Unmarshal([]byte(output), &list)).To(Succeed())
+		matches := make([]replicaSetIdentity, 0, 1)
+		for _, replicaSet := range list.Items {
+			for _, owner := range replicaSet.Metadata.OwnerReferences {
+				if owner.Kind == "Deployment" && owner.Name == workload {
+					g.Expect(replicaSet.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+					g.Expect(replicaSet.Spec.Template.Spec.Containers[0].Image).To(Equal(image))
+					matches = append(matches, replicaSetIdentity{
+						Name: replicaSet.Metadata.Name,
+						UID:  replicaSet.Metadata.UID,
+					})
+				}
+			}
+		}
+		g.Expect(matches).To(HaveLen(1))
+		result = matches[0]
+	}, 5*time.Minute, 2*time.Second).Should(Succeed())
+	return result
+}
+
 func eventuallyDeploymentPods(workload string, count int, image string) map[string]podIdentity {
 	var result map[string]podIdentity
 	Eventually(func(g Gomega) {
@@ -403,6 +465,11 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 					Name              string  `json:"name"`
 					UID               string  `json:"uid"`
 					DeletionTimestamp *string `json:"deletionTimestamp"`
+					OwnerReferences   []struct {
+						APIVersion string `json:"apiVersion"`
+						Kind       string `json:"kind"`
+						Controller bool   `json:"controller"`
+					} `json:"ownerReferences"`
 				} `json:"metadata"`
 				Spec struct {
 					Containers []struct {
@@ -427,6 +494,11 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 			g.Expect(pod.Spec.Containers).NotTo(BeEmpty())
 			g.Expect(pod.Spec.Containers[0].Image).To(Equal(image))
 			g.Expect(pod.Status.PodIP).NotTo(BeEmpty())
+			g.Expect(pod.Metadata.OwnerReferences).To(ContainElement(SatisfyAll(
+				HaveField("APIVersion", "apps.churnless.io/v1alpha1"),
+				HaveField("Kind", "ReplicaSet"),
+				HaveField("Controller", true),
+			)))
 			ready := false
 			for _, condition := range pod.Status.Conditions {
 				ready = ready || condition.Type == "Ready" && condition.Status == "True"

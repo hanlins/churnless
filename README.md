@@ -1,66 +1,81 @@
 # Churnless
 
-Churnless provides Kubernetes-compatible workload APIs that update container
-images in place. During an image-only rollout, the kubelet restarts containers
-inside the existing Pods, preserving each Pod's name, UID, and IP.
+Churnless provides Kubernetes-compatible `Deployment` and `ReplicaSet` APIs
+that can update container images without replacing Pods.
 
-The API group/version is `apps.churnless.io/v1alpha1`. Its Kinds intentionally
-match the native workload names; use fully qualified resource names with
-`kubectl` to disambiguate them from `apps/v1`:
+During an image-only rollout, Churnless restarts containers inside the
+existing Pods. Pod names, UIDs, and IPs remain stable as long as the Pods
+themselves are not deleted or rescheduled.
 
-| Kind | Native spec/status compatibility | Native shadow |
-| --- | --- | --- |
-| `Deployment` | `apps/v1.DeploymentSpec` and `DeploymentStatus` | `Deployment` |
-| `StatefulSet` | `apps/v1.StatefulSetSpec` and `StatefulSetStatus` | `StatefulSet` |
-| `ReplicaSet` | `apps/v1.ReplicaSetSpec` and `ReplicaSetStatus` | `ReplicaSet` |
+> [!IMPORTANT]
+> Churnless is experimental and its API is `v1alpha1`. Test it carefully
+> before using it for production workloads.
 
-The upstream types are embedded with `json:",inline"` in Go. This keeps their
-wire format and generated OpenAPI schema aligned with Kubernetes, including
-Pod templates, rollout strategies, affinity, probes, security contexts,
-StatefulSet PVC templates, and future fields picked up when the Kubernetes
-dependencies are upgraded.
+## Why Churnless?
 
-## How it works
+A native Kubernetes Deployment creates a new ReplicaSet whenever its Pod
+template changes. Updating an image therefore replaces Pods, which can cause
+Pod IP churn even when the application only needs a new container process.
 
-Each custom workload owns a same-name native workload. The native controller
-continues to provide ordinary behavior such as replica management, scheduling,
-self-healing, Deployment revision history, StatefulSet identity/PVC handling,
-and status conditions.
+Churnless changes the revision boundary:
 
-Before syncing an update, Churnless performs a dry-run update of the native
-workload. This applies the API server's native defaulting and validation:
+- Image changes are revisions within the current Churnless ReplicaSet.
+- Other Pod-template changes create a new Churnless ReplicaSet and use a
+  replacement rollout.
 
-- If only `spec.template.spec.containers[*].image` or
-  `initContainers[*].image` changed, the native template stays stable and
-  Churnless patches the existing Pods in availability-aware batches.
-- If any other template field changed, the complete desired template is
-  passed to the native workload and Kubernetes performs its normal replacement
-  rollout.
-- `StatefulSet` honors `RollingUpdate.partition` and descending ordinal
-  order. With `OnDelete`, Churnless updates the native template and leaves
-  existing Pods alone, matching native semantics.
-- A paused `Deployment` does not apply its pending image revision until
-  it is resumed.
+This preserves the normal Deployment-to-ReplicaSet responsibility split while
+allowing the ReplicaSet controller to reconcile mutable Pod image fields
+directly.
 
-Churnless watches both the shadow workload and its Pods. A newly created Pod
-after scaling or self-healing is brought to the latest desired image even when
-the shadow template intentionally remains on an older image.
-
-## Quick start
-
-Prerequisites are Go, Docker, kubectl, and access to a Kubernetes cluster.
-The repository was bootstrapped with native Kubebuilder v4.
-
-```sh
-make install
-make run
+```text
+Deployment.apps.churnless.io
+└── ReplicaSet.apps.churnless.io
+    └── Pod
 ```
 
-In another terminal:
+There are no native Deployment or ReplicaSet shadow objects.
+
+## Features
+
+- Familiar `Deployment` and `ReplicaSet` kinds under
+  `apps.churnless.io/v1alpha1`.
+- Native `apps/v1` spec and status types embedded directly in the Go API.
+- In-place updates for regular-container and init-container images.
+- Stable Pod name, UID, and IP during successful image-only rollouts.
+- Structural Deployment revisions backed by separate Churnless ReplicaSets.
+- RollingUpdate and Recreate orchestration for structural changes.
+- Selector-based Pod adoption and controller owner references.
+- Replica scaling, self-healing, readiness, availability, and rollout status.
+- Standard `/scale` subresources for `kubectl scale` and HPA.
+- Kubebuilder-native manifests, RBAC, tests, and local development workflow.
+
+## Quick start with kind
+
+Prerequisites:
+
+- Go
+- Docker
+- [kubectl](https://kubernetes.io/docs/tasks/tools/)
+- [kind](https://kind.sigs.k8s.io/)
+
+Create a local cluster, build and load the controller, install the CRDs, and
+deploy a two-replica sample:
 
 ```sh
-kubectl apply -f config/samples/apps_v1alpha1_deployment.yaml
-kubectl get deployments.apps.churnless.io,pods
+make kind-up
+```
+
+Inspect the custom Deployment, its Churnless ReplicaSet, and the Pods:
+
+```sh
+make kind-status
+```
+
+Record the initial Pod identities:
+
+```sh
+kubectl get pods -l app=deployment-sample \
+  -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP,IMAGE:.spec.containers[0].image'
 ```
 
 Apply an image-only revision:
@@ -71,19 +86,70 @@ kubectl patch deployment.apps.churnless.io deployment-sample \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"nginx:1.28-alpine","ports":[{"containerPort":80}]}]}}}}'
 ```
 
-The in-place progress is available under `status.inPlace`; native-compatible
-status fields remain at their usual paths.
+Run the identity command again after the Pods are ready. The image and
+container restart count change, while each Pod's name, UID, and IP remain the
+same.
+
+Delete the playground when finished:
+
+```sh
+make kind-down
+```
+
+The cluster name and controller image can be overridden:
+
+```sh
+KIND_CLUSTER=my-churnless \
+KIND_IMAGE=example.com/churnless:dev \
+make kind-up
+```
+
+## API compatibility
+
+The custom resources intentionally use the native kind names with a different
+group and version:
+
+| Kind | API version | Embedded Kubernetes types |
+| --- | --- | --- |
+| `Deployment` | `apps.churnless.io/v1alpha1` | `apps/v1.DeploymentSpec`, `apps/v1.DeploymentStatus` |
+| `ReplicaSet` | `apps.churnless.io/v1alpha1` | `apps/v1.ReplicaSetSpec`, `apps/v1.ReplicaSetStatus` |
+
+For supported behavior, a native manifest can be migrated by changing only
+its `apiVersion`:
+
+```yaml
+apiVersion: apps.churnless.io/v1alpha1
+kind: Deployment
+```
+
+Use fully qualified resource names when both native and Churnless APIs are
+installed:
+
+```sh
+kubectl get deployments.apps.churnless.io
+kubectl get replicasets.apps.churnless.io
+```
+
+The current compatibility boundary is deliberate:
+
+- The native field layout is preserved, but a CRD does not automatically
+  inherit every built-in admission default or validation rule.
+- Stock `kubectl rollout` does not register the custom GVK. Inspect
+  `status.inPlace` or use normal `kubectl get` and `kubectl wait` workflows.
+- Image-only revisions reuse one ReplicaSet and therefore do not appear as
+  separate native-style ReplicaSet history entries.
+- Progress-deadline enforcement, revision-history cleanup, and hash-collision
+  handling are not complete yet.
 
 ## HPA and scaling
 
-Every CRD exposes the standard `/scale` subresource:
+Both CRDs expose the standard `/scale` subresource:
 
 ```sh
-kubectl scale deployment.apps.churnless.io/deployment-sample \
-  --replicas=3
+kubectl scale deployment.apps.churnless.io/deployment-sample --replicas=3
 ```
 
-HPA can target the custom GVK directly:
+An HPA can target a Churnless Deployment directly:
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -106,38 +172,74 @@ spec:
         averageUtilization: 70
 ```
 
-`spec.replicas`, `status.replicas`, and `status.selector` are mapped to
-`autoscaling/v1.Scale`, so HPA sees the same paths it expects from native
-workloads.
+## Install on an existing cluster
 
-## Validation
+Build and publish a controller image, then install it with Kustomize:
 
 ```sh
+make docker-build docker-push IMG=ghcr.io/your-org/churnless:tag
+make deploy IMG=ghcr.io/your-org/churnless:tag
+```
+
+Apply one of the sample workloads:
+
+```sh
+kubectl apply -f config/samples/apps_v1alpha1_deployment.yaml
+```
+
+Remove the controller and CRDs:
+
+```sh
+make undeploy
+make uninstall
+```
+
+## Guarantees and limitations
+
+- In-place image updates preserve Pod identity only while the Pod continues to
+  exist on the same node.
+- Eviction, node failure, manual deletion, scheduling changes, and structural
+  Pod-template updates can still replace a Pod and change its IP.
+- Churnless updates only Kubernetes-mutable image fields in place. Other
+  template changes use a structural rollout.
+- With a zero effective `maxUnavailable`, Churnless restarts one Pod at a time
+  so an image rollout can make progress without replacing the original Pods.
+- A replacement Pod created during scaling or self-healing starts from the
+  latest ReplicaSet template.
+
+## Development
+
+The project was bootstrapped with Kubebuilder and follows its standard layout.
+
+Run the local checks:
+
+```sh
+make manifests generate
 make test
+make lint
+```
+
+Run the isolated kind end-to-end suite:
+
+```sh
 CERT_MANAGER_INSTALL_SKIP=true make test-e2e
 ```
 
-The envtest suite covers native shadow creation, complete embedded fields,
-image masking, Pod identity/IP preservation, StatefulSet partition data, and
-the scale subresource. The kind e2e test builds and deploys the manager, rolls a
-two-replica `Deployment`, asserts stable Pod UID/IP values, then scales
-it through `/scale` and verifies new Pods converge to the latest image.
+The e2e suite verifies:
 
-## Guarantees and limits
+- `Deployment.apps.churnless.io → ReplicaSet.apps.churnless.io → Pod`
+  controller ownership.
+- Absence of native Deployment and ReplicaSet shadows.
+- Stable Churnless ReplicaSet identity during an image revision.
+- Stable Pod names, UIDs, and IPs during the rollout.
+- New Pods created through `/scale` use the latest image.
 
-- Pod IP preservation applies to image-only changes while the Pod remains on
-  its node. Eviction, node failure, deletion, or another native replacement
-  condition can still create a new Pod and IP.
-- Kubernetes permits ordinary Pod updates only for a small set of fields,
-  including container and init-container images. Other template changes use
-  the native replacement path.
-- An in-place rollout cannot use Deployment `maxSurge` without creating extra
-  Pods. Churnless honors the `maxUnavailable` budget; if it rounds to zero,
-  one Pod must restart at a time for the rollout to make progress.
-- The same-name native workload is an implementation detail and must not
-  already be owned by another object.
-- Native `kubectl rollout history/undo` does not understand the custom GVK,
-  and image-only revisions intentionally do not create Deployment
-  ReplicaSets. Roll back by setting the previous image on the custom workload.
-- The API is currently `v1alpha1`; use versioned manifests and test upgrades
-  before production adoption.
+## Contributing
+
+Issues and pull requests are welcome. Please include tests for behavior
+changes and run `make test`, `make lint`, and the kind e2e suite before
+submitting a controller change.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

@@ -18,7 +18,13 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +40,8 @@ import (
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 )
 
+const structuralRevisionLabel = "apps.churnless.io/structural-revision"
+
 // DeploymentReconciler reconciles a Deployment.
 type DeploymentReconciler struct {
 	client.Client
@@ -43,10 +51,10 @@ type DeploymentReconciler struct {
 // +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;delete
 
-// Reconcile keeps a native Deployment in sync and applies image-only updates to its Pods.
+// Reconcile delegates Pod ownership to Churnless ReplicaSets.
 func (r *DeploymentReconciler) Reconcile(
 	ctx context.Context,
 	req ctrl.Request,
@@ -61,106 +69,204 @@ func (r *DeploymentReconciler) Reconcile(
 		workload.Spec.Replicas = &replicas
 		return ctrl.Result{Requeue: true}, r.Patch(ctx, &workload, client.MergeFrom(before))
 	}
-
-	selector, err := selectorString(workload.Spec.Selector)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("parse selector: %w", err)
+	if removed, err := r.removeLegacyShadow(ctx, &workload); err != nil || removed {
+		return ctrl.Result{Requeue: removed}, err
 	}
-	shadow, created, err := r.syncDeployment(ctx, &workload)
+
+	replicaSets, err := r.listReplicaSets(ctx, &workload)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if created {
-		return ctrl.Result{Requeue: true}, nil
+	revision := structuralRevision(&workload.Spec.Template)
+	current := replicaSetForRevision(replicaSets, revision)
+	if workload.Spec.Paused && current == nil && len(replicaSets) > 0 {
+		current = newestReplicaSet(replicaSets)
 	}
-
-	pods, err := listOwnedPods(ctx, r.Client, &workload)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	inPlace := !imagesEqual(&shadow.Spec.Template, &workload.Spec.Template)
-	if inPlace && !workload.Spec.Paused {
-		parallelism, err := deploymentParallelism(shadow)
+	if current == nil {
+		_, err = r.createReplicaSet(ctx, &workload, revision)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := updatePods(
-			ctx,
-			r.Client,
-			pods,
-			&workload.Spec.Template,
-			allPods,
-			parallelism,
-			nil,
-		); err != nil {
-			return ctrl.Result{}, err
-		}
+		return ctrl.Result{Requeue: true}, nil
 	}
-	progress := calculateProgress(pods, &workload.Spec.Template, allPods)
-	if err := r.updateDeploymentStatus(ctx, &workload, shadow, selector, progress, inPlace); err != nil {
+
+	parallelism, err := deploymentParallelism(&workload, replicaSets)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if inPlace && !workload.Spec.Paused {
-		return requeueWhileUpdating(progress), nil
+	if workload.Spec.Paused {
+		parallelism = 0
+	}
+	changed, err := r.syncReplicaSet(ctx, &workload, current, revision, parallelism)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if err := r.updateDeploymentStatus(ctx, &workload, current, replicaSets); err != nil {
+		return ctrl.Result{}, err
+	}
+	if workload.Spec.Paused {
+		return ctrl.Result{}, nil
+	}
+	changed, err = r.rollout(ctx, &workload, current, replicaSets)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if changed || !deploymentComplete(&workload, current, replicaSets) {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *DeploymentReconciler) syncDeployment(
+func (r *DeploymentReconciler) removeLegacyShadow(
 	ctx context.Context,
 	workload *appsv1alpha1.Deployment,
-) (*appsv1.Deployment, bool, error) {
+) (bool, error) {
 	var shadow appsv1.Deployment
-	key := client.ObjectKeyFromObject(workload)
-	if err := r.Get(ctx, key, &shadow); apierrors.IsNotFound(err) {
-		shadow = appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: workload.Name, Namespace: workload.Namespace},
-			Spec:       *workload.Spec.DeploymentSpec.DeepCopy(),
-		}
-		injectOwnership(&shadow.Spec.Template, workload, "Deployment")
-		r.Scheme.Default(&shadow)
-		if err := controllerutil.SetControllerReference(workload, &shadow, r.Scheme); err != nil {
-			return nil, false, err
-		}
-		if err := r.Create(ctx, &shadow); err != nil {
-			return nil, false, fmt.Errorf("create native Deployment: %w", err)
-		}
-		return &shadow, true, nil
+	if err := r.Get(ctx, client.ObjectKeyFromObject(workload), &shadow); apierrors.IsNotFound(err) {
+		return false, nil
 	} else if err != nil {
-		return nil, false, err
+		return false, err
 	}
 	if !metav1.IsControlledBy(&shadow, workload) {
-		return nil, false, fmt.Errorf(
-			"native Deployment %s/%s already exists and is not controlled by this resource",
-			shadow.Namespace,
-			shadow.Name,
-		)
+		return false, nil
 	}
-
-	candidate := shadow.DeepCopy()
-	candidate.Spec = *workload.Spec.DeploymentSpec.DeepCopy()
-	if err := r.Update(ctx, candidate, client.DryRunAll); err != nil {
-		return nil, false, fmt.Errorf("validate native Deployment update: %w", err)
+	if err := r.Delete(ctx, &shadow); client.IgnoreNotFound(err) != nil {
+		return false, fmt.Errorf("delete legacy native Deployment: %w", err)
 	}
-	candidate.Spec.Template = *prepareShadowTemplate(
-		&shadow.Spec.Template,
-		&candidate.Spec.Template,
-		workload,
-		"Deployment",
-		true,
-	)
-	if apiequality.Semantic.DeepEqual(shadow.Spec, candidate.Spec) {
-		return &shadow, false, nil
-	}
-	before := shadow.DeepCopy()
-	shadow.Spec = candidate.Spec
-	if err := r.Patch(ctx, &shadow, client.MergeFrom(before)); err != nil {
-		return nil, false, fmt.Errorf("update native Deployment: %w", err)
-	}
-	return &shadow, false, nil
+	return true, nil
 }
 
-func deploymentParallelism(deployment *appsv1.Deployment) (int, error) {
+func (r *DeploymentReconciler) listReplicaSets(
+	ctx context.Context,
+	workload *appsv1alpha1.Deployment,
+) ([]*appsv1alpha1.ReplicaSet, error) {
+	var list appsv1alpha1.ReplicaSetList
+	if err := r.List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+		return nil, err
+	}
+	result := make([]*appsv1alpha1.ReplicaSet, 0, len(list.Items))
+	for i := range list.Items {
+		if metav1.IsControlledBy(&list.Items[i], workload) {
+			result = append(result, &list.Items[i])
+		}
+	}
+	return result, nil
+}
+
+func structuralRevision(template *corev1.PodTemplateSpec) string {
+	copy := cleanTemplate(template)
+	clearImages(copy)
+	data, _ := json.Marshal(copy)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:5])
+}
+
+func replicaSetForRevision(
+	replicaSets []*appsv1alpha1.ReplicaSet,
+	revision string,
+) *appsv1alpha1.ReplicaSet {
+	for i := range replicaSets {
+		if replicaSets[i].Labels[structuralRevisionLabel] == revision {
+			return replicaSets[i]
+		}
+	}
+	return nil
+}
+
+func newestReplicaSet(replicaSets []*appsv1alpha1.ReplicaSet) *appsv1alpha1.ReplicaSet {
+	return slices.MaxFunc(replicaSets, func(left, right *appsv1alpha1.ReplicaSet) int {
+		return left.CreationTimestamp.Compare(right.CreationTimestamp.Time)
+	})
+}
+
+func replicaSetName(deploymentName, revision string) string {
+	const suffix = 1 + 10
+	maxPrefix := 63 - suffix
+	prefix := strings.TrimRight(deploymentName[:min(len(deploymentName), maxPrefix)], "-")
+	return prefix + "-" + revision
+}
+
+func (r *DeploymentReconciler) createReplicaSet(
+	ctx context.Context,
+	workload *appsv1alpha1.Deployment,
+	revision string,
+) (*appsv1alpha1.ReplicaSet, error) {
+	replicas := int32(0)
+	selector := workload.Spec.Selector.DeepCopy()
+	if selector.MatchLabels == nil {
+		selector.MatchLabels = map[string]string{}
+	}
+	selector.MatchLabels[structuralRevisionLabel] = revision
+	template := workload.Spec.Template.DeepCopy()
+	if template.Labels == nil {
+		template.Labels = map[string]string{}
+	}
+	template.Labels[structuralRevisionLabel] = revision
+
+	replicaSet := &appsv1alpha1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      replicaSetName(workload.Name, revision),
+			Namespace: workload.Namespace,
+			Labels: map[string]string{
+				structuralRevisionLabel: revision,
+			},
+			Annotations: map[string]string{inPlaceParallelismAnnotation: "0"},
+		},
+		Spec: appsv1alpha1.ReplicaSetSpec{ReplicaSetSpec: appsv1.ReplicaSetSpec{
+			Replicas:        &replicas,
+			MinReadySeconds: workload.Spec.MinReadySeconds,
+			Selector:        selector,
+			Template:        *template,
+		}},
+	}
+	if err := controllerutil.SetControllerReference(workload, replicaSet, r.Scheme); err != nil {
+		return nil, err
+	}
+	if err := r.Create(ctx, replicaSet); err != nil {
+		return nil, fmt.Errorf("create Churnless ReplicaSet: %w", err)
+	}
+	return replicaSet, nil
+}
+
+func (r *DeploymentReconciler) syncReplicaSet(
+	ctx context.Context,
+	workload *appsv1alpha1.Deployment,
+	replicaSet *appsv1alpha1.ReplicaSet,
+	revision string,
+	parallelism int,
+) (bool, error) {
+	before := replicaSet.DeepCopy()
+	if !workload.Spec.Paused {
+		template := workload.Spec.Template.DeepCopy()
+		if template.Labels == nil {
+			template.Labels = map[string]string{}
+		}
+		template.Labels[structuralRevisionLabel] = revision
+		replicaSet.Spec.Template = *template
+	}
+	replicaSet.Spec.MinReadySeconds = workload.Spec.MinReadySeconds
+	if replicaSet.Annotations == nil {
+		replicaSet.Annotations = map[string]string{}
+	}
+	replicaSet.Annotations[inPlaceParallelismAnnotation] = strconv.Itoa(parallelism)
+	if apiequality.Semantic.DeepEqual(before.Spec, replicaSet.Spec) &&
+		maps.Equal(before.Annotations, replicaSet.Annotations) {
+		return false, nil
+	}
+	if err := r.Patch(ctx, replicaSet, client.MergeFrom(before)); err != nil {
+		return false, fmt.Errorf("update Churnless ReplicaSet: %w", err)
+	}
+	return true, nil
+}
+
+func deploymentParallelism(
+	deployment *appsv1alpha1.Deployment,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) (int, error) {
 	replicas := int(desiredReplicas(deployment.Spec.Replicas))
 	if replicas == 0 {
 		return 0, nil
@@ -177,48 +283,277 @@ func deploymentParallelism(deployment *appsv1.Deployment) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("calculate maxUnavailable: %w", err)
 	}
-	unavailable := max(replicas-int(deployment.Status.AvailableReplicas), 0)
+	available := int32(0)
+	for i := range replicaSets {
+		available += replicaSets[i].Status.AvailableReplicas
+	}
+	unavailable := max(replicas-int(available), 0)
 	if maximum == 0 && unavailable == 0 {
-		// In-place replacement cannot use maxSurge, so one Pod must be restarted
-		// to make progress when the native rolling strategy permits only surge.
 		return 1, nil
 	}
-	return maximum - unavailable, nil
+	return max(maximum-unavailable, 0), nil
+}
+
+func (r *DeploymentReconciler) rollout(
+	ctx context.Context,
+	workload *appsv1alpha1.Deployment,
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) (bool, error) {
+	if workload.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		for i := range replicaSets {
+			if replicaSets[i].UID != current.UID && desiredReplicas(replicaSets[i].Spec.Replicas) > 0 {
+				return r.scaleReplicaSet(ctx, replicaSets[i], 0)
+			}
+		}
+		if totalOldReplicas(current, replicaSets) == 0 {
+			return r.scaleReplicaSet(ctx, current, desiredReplicas(workload.Spec.Replicas))
+		}
+		return false, nil
+	}
+
+	desired := desiredReplicas(workload.Spec.Replicas)
+	maxSurge, maxUnavailable, err := rollingLimits(workload, desired)
+	if err != nil {
+		return false, err
+	}
+	total := totalReplicaSpec(replicaSets)
+	currentReplicas := desiredReplicas(current.Spec.Replicas)
+	if currentReplicas < desired && total < desired+maxSurge {
+		increase := min(desired-currentReplicas, desired+maxSurge-total)
+		return r.scaleReplicaSet(ctx, current, currentReplicas+increase)
+	}
+
+	minAvailable := max(desired-maxUnavailable, 0)
+	totalAvailable := totalAvailableReplicas(replicaSets)
+	for i := range replicaSets {
+		old := replicaSets[i]
+		oldReplicas := desiredReplicas(old.Spec.Replicas)
+		if old.UID == current.UID || oldReplicas == 0 {
+			continue
+		}
+		unavailableOld := max(oldReplicas-old.Status.AvailableReplicas, 0)
+		availableBudget := max(totalAvailable-minAvailable, 0)
+		excess := max(total-desired, 0)
+		needed := max(desired-currentReplicas, 0)
+		decrease := min(oldReplicas, unavailableOld+availableBudget)
+		if excess > 0 {
+			decrease = min(decrease, excess)
+		} else {
+			decrease = min(decrease, needed)
+		}
+		if decrease > 0 {
+			return r.scaleReplicaSet(ctx, old, oldReplicas-decrease)
+		}
+	}
+	if currentReplicas != desired && totalOldReplicas(current, replicaSets) == 0 {
+		return r.scaleReplicaSet(ctx, current, desired)
+	}
+	return false, nil
+}
+
+func rollingLimits(
+	deployment *appsv1alpha1.Deployment,
+	replicas int32,
+) (int32, int32, error) {
+	surge := intstr.FromString("25%")
+	unavailable := intstr.FromString("25%")
+	if deployment.Spec.Strategy.RollingUpdate != nil {
+		if deployment.Spec.Strategy.RollingUpdate.MaxSurge != nil {
+			surge = *deployment.Spec.Strategy.RollingUpdate.MaxSurge
+		}
+		if deployment.Spec.Strategy.RollingUpdate.MaxUnavailable != nil {
+			unavailable = *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable
+		}
+	}
+	maxSurge, err := intstr.GetScaledValueFromIntOrPercent(&surge, int(replicas), true)
+	if err != nil {
+		return 0, 0, fmt.Errorf("calculate maxSurge: %w", err)
+	}
+	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&unavailable, int(replicas), false)
+	if err != nil {
+		return 0, 0, fmt.Errorf("calculate maxUnavailable: %w", err)
+	}
+	return int32(maxSurge), min(int32(maxUnavailable), replicas), nil
+}
+
+func (r *DeploymentReconciler) scaleReplicaSet(
+	ctx context.Context,
+	replicaSet *appsv1alpha1.ReplicaSet,
+	replicas int32,
+) (bool, error) {
+	if desiredReplicas(replicaSet.Spec.Replicas) == replicas {
+		return false, nil
+	}
+	before := replicaSet.DeepCopy()
+	replicaSet.Spec.Replicas = &replicas
+	if err := r.Patch(ctx, replicaSet, client.MergeFrom(before)); err != nil {
+		return false, fmt.Errorf("scale Churnless ReplicaSet %s/%s: %w", replicaSet.Namespace, replicaSet.Name, err)
+	}
+	return true, nil
+}
+
+func totalReplicaSpec(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
+	var total int32
+	for i := range replicaSets {
+		total += desiredReplicas(replicaSets[i].Spec.Replicas)
+	}
+	return total
+}
+
+func totalAvailableReplicas(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
+	var total int32
+	for i := range replicaSets {
+		total += replicaSets[i].Status.AvailableReplicas
+	}
+	return total
+}
+
+func totalOldReplicas(
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) int32 {
+	var total int32
+	for i := range replicaSets {
+		if replicaSets[i].UID != current.UID {
+			total += desiredReplicas(replicaSets[i].Spec.Replicas)
+		}
+	}
+	return total
 }
 
 func (r *DeploymentReconciler) updateDeploymentStatus(
 	ctx context.Context,
 	workload *appsv1alpha1.Deployment,
-	shadow *appsv1.Deployment,
-	selector string,
-	progress podProgress,
-	inPlace bool,
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
 ) error {
-	status := appsv1alpha1.DeploymentStatus{
-		DeploymentStatus: *shadow.Status.DeepCopy(),
+	selector, err := selectorString(workload.Spec.Selector)
+	if err != nil {
+		return fmt.Errorf("format selector: %w", err)
+	}
+	var status appsv1.DeploymentStatus
+	status.ObservedGeneration = workload.Generation
+	for i := range replicaSets {
+		status.Replicas += replicaSets[i].Status.Replicas
+		status.ReadyReplicas += replicaSets[i].Status.ReadyReplicas
+		status.AvailableReplicas += replicaSets[i].Status.AvailableReplicas
+	}
+	if current.Status.InPlace != nil {
+		status.UpdatedReplicas = current.Status.InPlace.UpdatedReplicas
+	}
+	status.UnavailableReplicas = max(desiredReplicas(workload.Spec.Replicas)-status.AvailableReplicas, 0)
+	status.Conditions = deploymentConditions(workload, status)
+	result := appsv1alpha1.DeploymentStatus{
+		DeploymentStatus: status,
 		Selector:         selector,
-		InPlace:          inPlaceStatus(progress),
+		InPlace:          current.Status.InPlace.DeepCopy(),
 	}
-	if shadow.Status.ObservedGeneration == shadow.Generation {
-		status.ObservedGeneration = workload.Generation
-	}
-	if inPlace {
-		status.UpdatedReplicas = progress.Updated
-	}
-	if apiequality.Semantic.DeepEqual(workload.Status, status) {
+	if apiequality.Semantic.DeepEqual(workload.Status, result) {
 		return nil
 	}
 	before := workload.DeepCopy()
-	workload.Status = status
+	workload.Status = result
 	return r.Status().Patch(ctx, workload, client.MergeFrom(before))
+}
+
+func deploymentConditions(
+	workload *appsv1alpha1.Deployment,
+	status appsv1.DeploymentStatus,
+) []appsv1.DeploymentCondition {
+	desired := desiredReplicas(workload.Spec.Replicas)
+	minAvailable := desired
+	if workload.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		_, maxUnavailable, err := rollingLimits(workload, desired)
+		if err == nil {
+			minAvailable = max(desired-maxUnavailable, 0)
+		}
+	}
+	available := status.AvailableReplicas >= minAvailable
+	availableCondition := appsv1.DeploymentCondition{
+		Type:   appsv1.DeploymentAvailable,
+		Status: corev1.ConditionFalse,
+		Reason: "MinimumReplicasUnavailable",
+		Message: fmt.Sprintf(
+			"Deployment has %d available replicas, requires at least %d",
+			status.AvailableReplicas,
+			minAvailable,
+		),
+	}
+	if available {
+		availableCondition.Status = corev1.ConditionTrue
+		availableCondition.Reason = "MinimumReplicasAvailable"
+		availableCondition.Message = "Deployment has minimum availability"
+	}
+
+	progressingCondition := appsv1.DeploymentCondition{
+		Type:   appsv1.DeploymentProgressing,
+		Status: corev1.ConditionTrue,
+		Reason: "ReplicaSetUpdated",
+		Message: fmt.Sprintf(
+			"Deployment is updating %d of %d replicas",
+			status.UpdatedReplicas,
+			desired,
+		),
+	}
+	switch {
+	case workload.Spec.Paused:
+		progressingCondition.Status = corev1.ConditionUnknown
+		progressingCondition.Reason = "DeploymentPaused"
+		progressingCondition.Message = "Deployment is paused"
+	case status.UpdatedReplicas == desired && status.AvailableReplicas == desired:
+		progressingCondition.Reason = "NewReplicaSetAvailable"
+		progressingCondition.Message = "Deployment rollout is complete"
+	}
+	return []appsv1.DeploymentCondition{
+		preserveConditionTime(workload.Status.Conditions, availableCondition),
+		preserveConditionTime(workload.Status.Conditions, progressingCondition),
+	}
+}
+
+func preserveConditionTime(
+	existing []appsv1.DeploymentCondition,
+	condition appsv1.DeploymentCondition,
+) appsv1.DeploymentCondition {
+	now := metav1.Now()
+	condition.LastUpdateTime = now
+	condition.LastTransitionTime = now
+	for i := range existing {
+		if existing[i].Type != condition.Type {
+			continue
+		}
+		if existing[i].Status == condition.Status {
+			condition.LastTransitionTime = existing[i].LastTransitionTime
+		}
+		if existing[i].Status == condition.Status &&
+			existing[i].Reason == condition.Reason &&
+			existing[i].Message == condition.Message {
+			condition.LastUpdateTime = existing[i].LastUpdateTime
+		}
+		break
+	}
+	return condition
+}
+
+func deploymentComplete(
+	workload *appsv1alpha1.Deployment,
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) bool {
+	desired := desiredReplicas(workload.Spec.Replicas)
+	return totalOldReplicas(current, replicaSets) == 0 &&
+		desiredReplicas(current.Spec.Replicas) == desired &&
+		current.Status.InPlace != nil &&
+		current.Status.InPlace.UpdatedReplicas == desired &&
+		current.Status.InPlace.ReadyUpdatedReplicas == desired &&
+		current.Status.AvailableReplicas == desired
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Deployment{}).
-		Owns(&appsv1.Deployment{}).
-		Watches(&corev1.Pod{}, podWatch("Deployment")).
+		Owns(&appsv1alpha1.ReplicaSet{}).
 		Named("deployment").
 		Complete(r)
 }

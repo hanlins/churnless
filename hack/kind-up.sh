@@ -105,8 +105,8 @@ make manifests generate
 "${kubectl_bin}" --context "${context}" apply -k config/default
 "${kubectl_bin}" --context "${context}" wait \
   --for=condition=Established \
-  crd/deployments.apps.churnless.io \
-  crd/replicasets.apps.churnless.io \
+  crd/deployments.churnless.io \
+  crd/replicasets.churnless.io \
   --timeout="${timeout}"
 "${kubectl_bin}" --context "${context}" -n churnless-system set image \
   deployment/churnless-controller-manager \
@@ -135,7 +135,7 @@ fi
 
 echo "Deploying the sample custom Deployment..."
 "${kubectl_bin}" --context "${context}" apply \
-  -f config/samples/apps_v1alpha1_deployment.yaml
+  -f config/samples/churnless_v1alpha1_deployment.yaml
 pods_exist=false
 for ((attempt = 0; attempt < wait_seconds; attempt++)); do
   pod_count="$("${kubectl_bin}" --context "${context}" get pods \
@@ -161,10 +161,10 @@ echo
 echo "Churnless is ready in kubectl context ${context}."
 echo
 "${kubectl_bin}" --context "${context}" get \
-  deployment.apps.churnless.io/deployment-sample
+  deployment.churnless.io/deployment-sample
 "${kubectl_bin}" --context "${context}" get \
-  replicasets.apps.churnless.io \
-  -l apps.churnless.io/structural-revision
+  replicasets.churnless.io \
+  -l churnless.io/structural-revision
 "${kubectl_bin}" --context "${context}" get \
   pods \
   -l app=deployment-sample \

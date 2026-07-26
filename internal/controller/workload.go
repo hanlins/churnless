@@ -35,7 +35,7 @@ import (
 	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
-const revisionAnnotation = "apps.churnless.io/image-revision"
+const revisionAnnotation = "churnless.io/image-revision"
 
 type podProgress struct {
 	Revision string

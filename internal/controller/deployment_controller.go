@@ -42,7 +42,7 @@ import (
 	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
-const structuralRevisionLabel = "apps.churnless.io/structural-revision"
+const structuralRevisionLabel = "churnless.io/structural-revision"
 
 // DeploymentReconciler reconciles a Deployment.
 type DeploymentReconciler struct {
@@ -51,10 +51,10 @@ type DeploymentReconciler struct {
 	Scheme    *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=churnless.io,resources=deployments/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=churnless.io,resources=deployments/finalizers,verbs=update
+// +kubebuilder:rbac:groups=churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;delete
 
 // Reconcile delegates Pod ownership to Churnless ReplicaSets.

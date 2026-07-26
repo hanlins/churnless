@@ -40,7 +40,7 @@ import (
 	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
-const inPlaceParallelismAnnotation = "apps.churnless.io/in-place-parallelism"
+const inPlaceParallelismAnnotation = "churnless.io/in-place-parallelism"
 
 // ReplicaSetReconciler reconciles a ReplicaSet.
 type ReplicaSetReconciler struct {
@@ -49,9 +49,9 @@ type ReplicaSetReconciler struct {
 	Scheme    *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps.churnless.io,resources=replicasets/finalizers,verbs=update
+// +kubebuilder:rbac:groups=churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=churnless.io,resources=replicasets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=churnless.io,resources=replicasets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 

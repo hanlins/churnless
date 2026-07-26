@@ -46,8 +46,8 @@ scaling, or a structural template change.
 ## System model
 
 ```text
-Deployment.apps.churnless.io
-└── ReplicaSet.apps.churnless.io
+Deployment.churnless.io
+└── ReplicaSet.churnless.io
     └── Pod
 ```
 
@@ -67,12 +67,17 @@ child controller.
 
 ## API contract
 
-The public API group is `apps.churnless.io/v1alpha1`:
+The public API group is `churnless.io/v1alpha1`:
 
-| Kind | Spec | Status |
-| --- | --- | --- |
-| `Deployment` | Inline `apps/v1.DeploymentSpec` | Inline `apps/v1.DeploymentStatus` plus Churnless progress |
-| `ReplicaSet` | Inline `apps/v1.ReplicaSetSpec` | Inline `apps/v1.ReplicaSetStatus` plus Churnless progress |
+| Kind | Resource | Short name | Spec | Status |
+| --- | --- | --- | --- | --- |
+| `Deployment` | `deployments.churnless.io` | `cdeploy` | Inline `apps/v1.DeploymentSpec` | Inline `apps/v1.DeploymentStatus` plus Churnless progress |
+| `ReplicaSet` | `replicasets.churnless.io` | `chrs` | Inline `apps/v1.ReplicaSetSpec` | Inline `apps/v1.ReplicaSetStatus` plus Churnless progress |
+
+Both resources belong to the `churnless` kubectl category, so
+`kubectl get churnless` lists them together. Short names are intended for
+interactive use; automation should use fully qualified resource names. Native
+`deploy` and `rs` shortcuts remain reserved for native `apps/v1` resources.
 
 Inlining preserves the native JSON field layout and Go field vocabulary. The
 Churnless status extension is:
@@ -183,7 +188,7 @@ The ReplicaSet:
 1. Counts Pods already updated and Pods still restarting.
 2. Selects no more than the allowed number of additional Pods.
 3. Patches images by container name.
-4. Annotates each Pod with `apps.churnless.io/image-revision`.
+4. Annotates each Pod with `churnless.io/image-revision`.
 5. Considers a Pod complete only when its spec, kubelet-observed image status,
    and readiness all match the desired revision.
 
@@ -215,7 +220,7 @@ Every controller change must preserve these invariants:
   controlled Pods that stop matching are released.
 - Status reflects observed objects and never substitutes for desired state.
 
-Internal labels and annotations under `apps.churnless.io/` are controller
+Internal labels and annotations under `churnless.io/` are controller
 implementation details. They must not become the only source of ownership;
 Kubernetes controller owner references remain authoritative.
 
@@ -246,7 +251,7 @@ cross-controller behavior in an isolated kind cluster.
 
 The acceptance suite must continue to verify:
 
-- `Deployment.apps.churnless.io → ReplicaSet.apps.churnless.io → Pod`
+- `Deployment.churnless.io → ReplicaSet.churnless.io → Pod`
   controller ownership.
 - Absence of native shadow workloads.
 - Stable ReplicaSet name and UID for image-only revisions.

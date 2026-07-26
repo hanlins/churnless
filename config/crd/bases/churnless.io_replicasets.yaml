@@ -4,25 +4,29 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: deployments.apps.churnless.io
+  name: replicasets.churnless.io
 spec:
-  group: apps.churnless.io
+  group: churnless.io
   names:
-    kind: Deployment
-    listKind: DeploymentList
-    plural: deployments
-    singular: deployment
+    categories:
+    - churnless
+    kind: ReplicaSet
+    listKind: ReplicaSetList
+    plural: replicasets
+    shortNames:
+    - chrs
+    singular: replicaset
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Desired
+      type: integer
+    - jsonPath: .status.replicas
+      name: Current
+      type: integer
     - jsonPath: .status.readyReplicas
       name: Ready
-      type: integer
-    - jsonPath: .status.updatedReplicas
-      name: Up-to-date
-      type: integer
-    - jsonPath: .status.availableReplicas
-      name: Available
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -42,15 +46,7 @@ spec:
               minReadySeconds:
                 format: int32
                 type: integer
-              paused:
-                type: boolean
-              progressDeadlineSeconds:
-                format: int32
-                type: integer
               replicas:
-                format: int32
-                type: integer
-              revisionHistoryLimit:
                 format: int32
                 type: integer
               selector:
@@ -79,24 +75,6 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
-              strategy:
-                properties:
-                  rollingUpdate:
-                    properties:
-                      maxSurge:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        x-kubernetes-int-or-string: true
-                      maxUnavailable:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        x-kubernetes-int-or-string: true
-                    type: object
-                  type:
-                    type: string
-                type: object
               template:
                 properties:
                   metadata:
@@ -3917,23 +3895,16 @@ spec:
                 type: object
             required:
             - selector
-            - template
             type: object
           status:
             properties:
               availableReplicas:
                 format: int32
                 type: integer
-              collisionCount:
-                format: int32
-                type: integer
               conditions:
                 items:
                   properties:
                     lastTransitionTime:
-                      format: date-time
-                      type: string
-                    lastUpdateTime:
                       format: date-time
                       type: string
                     message:
@@ -3952,6 +3923,9 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              fullyLabeledReplicas:
+                format: int32
+                type: integer
               inPlace:
                 properties:
                   readyUpdatedReplicas:
@@ -3977,12 +3951,8 @@ spec:
               terminatingReplicas:
                 format: int32
                 type: integer
-              unavailableReplicas:
-                format: int32
-                type: integer
-              updatedReplicas:
-                format: int32
-                type: integer
+            required:
+            - replicas
             type: object
         required:
         - spec

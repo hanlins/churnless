@@ -57,6 +57,7 @@ type DeploymentStatus struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:resource:shortName=cdeploy,categories=churnless
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=".status.readyReplicas"

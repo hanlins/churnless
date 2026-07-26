@@ -129,10 +129,10 @@ kind-status: ## Show the controller, custom Deployment/ReplicaSet, and sample Po
 	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
 		-n churnless-system get deployment.apps/churnless-controller-manager
 	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
-		get deployment.apps.churnless.io/deployment-sample
+		get deployment.churnless.io/deployment-sample
 	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
-		get replicasets.apps.churnless.io \
-		-l apps.churnless.io/structural-revision
+		get replicasets.churnless.io \
+		-l churnless.io/structural-revision
 	@"$(KUBECTL)" --context "kind-$(KIND_CLUSTER)" \
 		get pods -l app=deployment-sample -o wide
 

@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.15.0
-domain: churnless.io
+domain: io
 layout:
 - go.kubebuilder.io/v4
 projectName: churnless
@@ -13,8 +13,8 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: churnless.io
-  group: apps
+  domain: io
+  group: churnless
   kind: Deployment
   path: github.com/hanlins/churnless/api/v1alpha1
   version: v1alpha1
@@ -26,8 +26,8 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: churnless.io
-  group: apps
+  domain: io
+  group: churnless
   kind: ReplicaSet
   path: github.com/hanlins/churnless/api/v1alpha1
   version: v1alpha1

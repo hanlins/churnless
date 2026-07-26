@@ -175,6 +175,76 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
 
+		It("should expose distinct resource names, short names, and category", func() {
+			By("checking the Churnless discovery document")
+			cmd := exec.Command("kubectl", "get", "--raw", "/apis/churnless.io/v1alpha1")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			var discovery struct {
+				GroupVersion string `json:"groupVersion"`
+				Resources    []struct {
+					Name       string   `json:"name"`
+					Kind       string   `json:"kind"`
+					ShortNames []string `json:"shortNames"`
+					Categories []string `json:"categories"`
+				} `json:"resources"`
+			}
+			Expect(json.Unmarshal([]byte(output), &discovery)).To(Succeed())
+			Expect(discovery.GroupVersion).To(Equal("churnless.io/v1alpha1"))
+
+			resources := make(map[string]struct {
+				Kind       string
+				ShortNames []string
+				Categories []string
+			})
+			for _, resource := range discovery.Resources {
+				resources[resource.Name] = struct {
+					Kind       string
+					ShortNames []string
+					Categories []string
+				}{
+					Kind:       resource.Kind,
+					ShortNames: resource.ShortNames,
+					Categories: resource.Categories,
+				}
+			}
+			Expect(resources).To(HaveKeyWithValue(
+				"deployments",
+				SatisfyAll(
+					HaveField("Kind", "Deployment"),
+					HaveField("ShortNames", ContainElement("cdeploy")),
+					HaveField("Categories", ContainElement("churnless")),
+				),
+			))
+			Expect(resources).To(HaveKeyWithValue(
+				"replicasets",
+				SatisfyAll(
+					HaveField("Kind", "ReplicaSet"),
+					HaveField("ShortNames", ContainElement("chrs")),
+					HaveField("Categories", ContainElement("churnless")),
+				),
+			))
+
+			By("resolving the Churnless short names and category")
+			for _, resource := range []string{"cdeploy", "chrs", "churnless"} {
+				cmd = exec.Command("kubectl", "get", resource, "--all-namespaces", "-o", "name")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to resolve %s", resource)
+			}
+
+			By("ensuring the native short names still resolve to apps/v1 resources")
+			cmd = exec.Command("kubectl", "get", "deploy", "-n", namespace, "-o", "name")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("deployment.apps/churnless-controller-manager"))
+
+			cmd = exec.Command("kubectl", "get", "rs", "-n", namespace, "-o", "name")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("replicaset.apps/churnless-controller-manager-"))
+		})
+
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			cmd := exec.Command(
 				"kubectl",
@@ -336,7 +406,7 @@ var _ = Describe("Manager", Ordered, func() {
 				cmd := exec.Command(
 					"kubectl",
 					"delete",
-					"deployment.apps.churnless.io",
+					"deployment.churnless.io",
 					workload,
 					"--ignore-not-found",
 				)
@@ -348,7 +418,7 @@ var _ = Describe("Manager", Ordered, func() {
 				"kubectl",
 				"apply",
 				"-f",
-				"config/samples/apps_v1alpha1_deployment.yaml",
+				"config/samples/churnless_v1alpha1_deployment.yaml",
 			)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -356,11 +426,42 @@ var _ = Describe("Manager", Ordered, func() {
 			before := eventuallyDeploymentPods(workload, 2, oldImage)
 			replicaSetBefore := eventuallyDeploymentReplicaSet(workload, oldImage)
 
+			By("resolving Churnless resources through their ergonomic names")
+			cmd = exec.Command("kubectl", "get", "cdeploy/"+workload, "-o", "name")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).To(Equal("deployment.churnless.io/" + workload))
+
+			cmd = exec.Command(
+				"kubectl",
+				"get",
+				"chrs/"+replicaSetBefore.Name,
+				"-o",
+				"name",
+			)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).To(Equal("replicaset.churnless.io/" + replicaSetBefore.Name))
+
+			cmd = exec.Command(
+				"kubectl",
+				"get",
+				"churnless",
+				"-o",
+				"name",
+			)
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(utils.GetNonEmptyLines(output)).To(ConsistOf(
+				"deployment.churnless.io/"+workload,
+				"replicaset.churnless.io/"+replicaSetBefore.Name,
+			))
+
 			By("changing only the image")
 			cmd = exec.Command(
 				"kubectl",
 				"patch",
-				"deployment.apps.churnless.io",
+				"deployment.churnless.io",
 				workload,
 				"--type=merge",
 				"-p",
@@ -396,7 +497,7 @@ var _ = Describe("Manager", Ordered, func() {
 				"-o",
 				"jsonpath={.items[*].metadata.name}",
 			)
-			output, err := utils.Run(cmd)
+			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(BeEmpty(), "a native shadow ReplicaSet must not exist")
 
@@ -404,7 +505,7 @@ var _ = Describe("Manager", Ordered, func() {
 			cmd = exec.Command(
 				"kubectl",
 				"scale",
-				"deployment.apps.churnless.io/"+workload,
+				"deployment.churnless.io/"+workload,
 				"--replicas=3",
 			)
 			_, err = utils.Run(cmd)
@@ -422,7 +523,7 @@ metadata:
   name: %s
 spec:
   scaleTargetRef:
-    apiVersion: apps.churnless.io/v1alpha1
+    apiVersion: churnless.io/v1alpha1
     kind: Deployment
     name: %s
   minReplicas: 1
@@ -451,7 +552,7 @@ spec:
 				cmd := exec.Command(
 					"kubectl",
 					"get",
-					"deployment.apps.churnless.io",
+					"deployment.churnless.io",
 					workload,
 					"-o",
 					"jsonpath={.spec.replicas}",
@@ -467,7 +568,7 @@ spec:
 			native, err := serverDryRunDeployment("apps/v1", "admission-defaults", true)
 			Expect(err).NotTo(HaveOccurred())
 			churnless, err := serverDryRunDeployment(
-				"apps.churnless.io/v1alpha1",
+				"churnless.io/v1alpha1",
 				"admission-defaults",
 				true,
 			)
@@ -476,7 +577,7 @@ spec:
 
 			_, nativeErr := serverDryRunDeployment("apps/v1", "admission-invalid", false)
 			_, churnlessErr := serverDryRunDeployment(
-				"apps.churnless.io/v1alpha1",
+				"churnless.io/v1alpha1",
 				"admission-invalid",
 				false,
 			)
@@ -489,7 +590,7 @@ spec:
 			)
 			Expect(err).NotTo(HaveOccurred())
 			churnlessReplicaSet, err := serverDryRunReplicaSet(
-				"apps.churnless.io/v1alpha1",
+				"churnless.io/v1alpha1",
 				"replicaset-admission-defaults",
 			)
 			Expect(err).NotTo(HaveOccurred())
@@ -607,7 +708,7 @@ func eventuallyDeploymentReplicaSet(workload, image string) replicaSetIdentity {
 		cmd := exec.Command(
 			"kubectl",
 			"get",
-			"replicasets.apps.churnless.io",
+			"replicasets.churnless.io",
 			"-o",
 			"json",
 		)
@@ -704,7 +805,7 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 			g.Expect(pod.Spec.Containers[0].Image).To(Equal(image))
 			g.Expect(pod.Status.PodIP).NotTo(BeEmpty())
 			g.Expect(pod.Metadata.OwnerReferences).To(ContainElement(SatisfyAll(
-				HaveField("APIVersion", "apps.churnless.io/v1alpha1"),
+				HaveField("APIVersion", "churnless.io/v1alpha1"),
 				HaveField("Kind", "ReplicaSet"),
 				HaveField("Controller", true),
 			)))

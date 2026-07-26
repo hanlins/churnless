@@ -1,25 +1,22 @@
-apiVersion: apps.churnless.io/v1alpha1
-kind: Deployment
+apiVersion: churnless.io/v1alpha1
+kind: ReplicaSet
 metadata:
   labels:
     app.kubernetes.io/name: churnless
     app.kubernetes.io/managed-by: kustomize
-  name: deployment-sample
+  name: replicaset-sample
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: deployment-sample
+      app: replicaset-sample
   template:
     metadata:
       labels:
-        app: deployment-sample
+        app: replicaset-sample
     spec:
       containers:
       - name: nginx
         image: nginx:1.27-alpine
         ports:
         - containerPort: 80
-        resources:
-          requests:
-            cpu: 100m

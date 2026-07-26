@@ -36,7 +36,7 @@ func SetupReplicaSetWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/mutate-apps-churnless-io-v1alpha1-replicaset,mutating=true,failurePolicy=fail,sideEffects=None,groups=apps.churnless.io,resources=replicasets,verbs=create;update,versions=v1alpha1,name=mreplicaset-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-churnless-io-v1alpha1-replicaset,mutating=true,failurePolicy=fail,sideEffects=None,groups=churnless.io,resources=replicasets,verbs=create;update,versions=v1alpha1,name=mreplicaset-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // ReplicaSetCustomDefaulter struct is responsible for setting default values on the custom resource of the
 // Kind ReplicaSet when those are created or updated.
@@ -52,7 +52,7 @@ func (d *ReplicaSetCustomDefaulter) Default(_ context.Context, obj *appsv1alpha1
 }
 
 // NOTE: If you want to customise the 'path', use the flags '--defaulting-path' or '--validation-path'.
-// +kubebuilder:webhook:path=/validate-apps-churnless-io-v1alpha1-replicaset,mutating=false,failurePolicy=fail,sideEffects=None,groups=apps.churnless.io,resources=replicasets,verbs=create;update,versions=v1alpha1,name=vreplicaset-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-churnless-io-v1alpha1-replicaset,mutating=false,failurePolicy=fail,sideEffects=None,groups=churnless.io,resources=replicasets,verbs=create;update,versions=v1alpha1,name=vreplicaset-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // ReplicaSetCustomValidator struct is responsible for validating the ReplicaSet resource
 // when it is created, updated, or deleted.

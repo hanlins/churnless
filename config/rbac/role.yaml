@@ -26,7 +26,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - apps.churnless.io
+  - churnless.io
   resources:
   - deployments
   - replicasets
@@ -39,14 +39,14 @@ rules:
   - update
   - watch
 - apiGroups:
-  - apps.churnless.io
+  - churnless.io
   resources:
   - deployments/finalizers
   - replicasets/finalizers
   verbs:
   - update
 - apiGroups:
-  - apps.churnless.io
+  - churnless.io
   resources:
   - deployments/status
   - replicasets/status

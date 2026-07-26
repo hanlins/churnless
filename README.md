@@ -18,8 +18,8 @@ churn their IPs. Churnless treats images as mutable revisions inside a
 ReplicaSet and patches the existing Pods instead.
 
 ```text
-Deployment.apps.churnless.io
-└── ReplicaSet.apps.churnless.io
+Deployment.churnless.io
+└── ReplicaSet.churnless.io
     └── Pod
 ```
 
@@ -27,7 +27,7 @@ Churnless uses no native Deployment or ReplicaSet shadow objects.
 
 Highlights:
 
-- `Deployment` and `ReplicaSet` under `apps.churnless.io/v1alpha1`
+- `Deployment` and `ReplicaSet` under `churnless.io/v1alpha1`
 - Native `apps/v1` specs and statuses embedded in the Go API
 - In-place regular-container and init-container image updates
 - RollingUpdate and Recreate for structural template changes
@@ -59,10 +59,10 @@ Inspect the custom Deployment, its Churnless ReplicaSet, and the Pods:
 make kind-status
 ```
 
-Patch the sample image:
+Patch the sample image using the Churnless Deployment short name:
 
 ```sh
-kubectl patch deployment.apps.churnless.io deployment-sample \
+kubectl patch cdeploy deployment-sample \
   --type=merge \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"nginx:1.28-alpine","ports":[{"containerPort":80}]}]}}}}'
 ```
@@ -85,17 +85,21 @@ make kind-down
 For supported behavior, migrate a native manifest by changing its API version:
 
 ```yaml
-apiVersion: apps.churnless.io/v1alpha1
+apiVersion: churnless.io/v1alpha1
 kind: Deployment
 ```
 
-Use fully qualified resource names to distinguish Churnless resources from
-native ones:
+Use the distinct Churnless short names for interactive commands:
 
 ```sh
-kubectl get deployments.apps.churnless.io
-kubectl scale deployment.apps.churnless.io/deployment-sample --replicas=3
+kubectl get cdeploy
+kubectl get chrs
+kubectl get churnless
+kubectl scale cdeploy/deployment-sample --replicas=3
 ```
+
+For scripts, use fully qualified resource names such as
+`deployments.churnless.io` and `replicasets.churnless.io`.
 
 HPA can target the Churnless GVK directly through its standard `/scale`
 subresource.

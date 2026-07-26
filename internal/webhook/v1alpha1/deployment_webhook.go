@@ -36,7 +36,7 @@ func SetupDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/mutate-apps-churnless-io-v1alpha1-deployment,mutating=true,failurePolicy=fail,sideEffects=None,groups=apps.churnless.io,resources=deployments,verbs=create;update,versions=v1alpha1,name=mdeployment-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-churnless-io-v1alpha1-deployment,mutating=true,failurePolicy=fail,sideEffects=None,groups=churnless.io,resources=deployments,verbs=create;update,versions=v1alpha1,name=mdeployment-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // DeploymentCustomDefaulter struct is responsible for setting default values on the custom resource of the
 // Kind Deployment when those are created or updated.
@@ -52,7 +52,7 @@ func (d *DeploymentCustomDefaulter) Default(_ context.Context, obj *appsv1alpha1
 }
 
 // NOTE: If you want to customise the 'path', use the flags '--defaulting-path' or '--validation-path'.
-// +kubebuilder:webhook:path=/validate-apps-churnless-io-v1alpha1-deployment,mutating=false,failurePolicy=fail,sideEffects=None,groups=apps.churnless.io,resources=deployments,verbs=create;update,versions=v1alpha1,name=vdeployment-v1alpha1.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-churnless-io-v1alpha1-deployment,mutating=false,failurePolicy=fail,sideEffects=None,groups=churnless.io,resources=deployments,verbs=create;update,versions=v1alpha1,name=vdeployment-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // DeploymentCustomValidator struct is responsible for validating the Deployment resource
 // when it is created, updated, or deleted.

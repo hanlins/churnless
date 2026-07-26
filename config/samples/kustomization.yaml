@@ -1,5 +1,5 @@
 ## Append samples of your project ##
 resources:
-- apps_v1alpha1_deployment.yaml
-- apps_v1alpha1_replicaset.yaml
+- churnless_v1alpha1_deployment.yaml
+- churnless_v1alpha1_replicaset.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

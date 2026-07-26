@@ -10,12 +10,12 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
-      path: /mutate-apps-churnless-io-v1alpha1-deployment
+      path: /mutate-churnless-io-v1alpha1-deployment
   failurePolicy: Fail
   name: mdeployment-v1alpha1.kb.io
   rules:
   - apiGroups:
-    - apps.churnless.io
+    - churnless.io
     apiVersions:
     - v1alpha1
     operations:
@@ -30,12 +30,12 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
-      path: /mutate-apps-churnless-io-v1alpha1-replicaset
+      path: /mutate-churnless-io-v1alpha1-replicaset
   failurePolicy: Fail
   name: mreplicaset-v1alpha1.kb.io
   rules:
   - apiGroups:
-    - apps.churnless.io
+    - churnless.io
     apiVersions:
     - v1alpha1
     operations:
@@ -56,12 +56,12 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
-      path: /validate-apps-churnless-io-v1alpha1-deployment
+      path: /validate-churnless-io-v1alpha1-deployment
   failurePolicy: Fail
   name: vdeployment-v1alpha1.kb.io
   rules:
   - apiGroups:
-    - apps.churnless.io
+    - churnless.io
     apiVersions:
     - v1alpha1
     operations:
@@ -76,12 +76,12 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
-      path: /validate-apps-churnless-io-v1alpha1-replicaset
+      path: /validate-churnless-io-v1alpha1-replicaset
   failurePolicy: Fail
   name: vreplicaset-v1alpha1.kb.io
   rules:
   - apiGroups:
-    - apps.churnless.io
+    - churnless.io
     apiVersions:
     - v1alpha1
     operations:

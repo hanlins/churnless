@@ -33,6 +33,7 @@ Highlights:
 - RollingUpdate and Recreate for structural template changes
 - Scaling, self-healing, Pod adoption, availability, and rollout status
 - Standard `/scale` support for `kubectl scale` and HPA
+- Upstream Kubernetes v1.36 workload defaulting and validation
 - Kubebuilder-native manifests and an isolated kind test workflow
 
 ## Try it with kind
@@ -45,7 +46,8 @@ Prerequisites:
 - [kind](https://kind.sigs.k8s.io/)
 
 Create a local cluster, build and load the controller, install the CRDs, and
-deploy a two-replica sample:
+deploy a two-replica sample. The setup also installs pinned cert-manager and
+Metrics Server releases for webhook and HPA testing:
 
 ```sh
 make kind-up
@@ -119,7 +121,7 @@ make lint
 Run the isolated kind end-to-end suite:
 
 ```sh
-CERT_MANAGER_INSTALL_SKIP=true make test-e2e
+make test-e2e
 ```
 
 ## Contributing

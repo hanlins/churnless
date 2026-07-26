@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
+	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
 const structuralRevisionLabel = "apps.churnless.io/structural-revision"
@@ -45,7 +47,8 @@ const structuralRevisionLabel = "apps.churnless.io/structural-revision"
 // DeploymentReconciler reconciles a Deployment.
 type DeploymentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=apps.churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -115,8 +118,11 @@ func (r *DeploymentReconciler) Reconcile(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if changed || !deploymentComplete(&workload, current, replicaSets) {
+	if changed {
 		return ctrl.Result{Requeue: true}, nil
+	}
+	if !deploymentComplete(&workload, current, replicaSets) {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -126,7 +132,7 @@ func (r *DeploymentReconciler) removeLegacyShadow(
 	workload *appsv1alpha1.Deployment,
 ) (bool, error) {
 	var shadow appsv1.Deployment
-	if err := r.Get(ctx, client.ObjectKeyFromObject(workload), &shadow); apierrors.IsNotFound(err) {
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(workload), &shadow); apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
@@ -145,7 +151,7 @@ func (r *DeploymentReconciler) listReplicaSets(
 	workload *appsv1alpha1.Deployment,
 ) ([]*appsv1alpha1.ReplicaSet, error) {
 	var list appsv1alpha1.ReplicaSetList
-	if err := r.List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+	if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
 		return nil, err
 	}
 	result := make([]*appsv1alpha1.ReplicaSet, 0, len(list.Items))
@@ -195,6 +201,9 @@ func (r *DeploymentReconciler) createReplicaSet(
 	workload *appsv1alpha1.Deployment,
 	revision string,
 ) (*appsv1alpha1.ReplicaSet, error) {
+	if workload.Spec.Selector == nil {
+		return nil, fmt.Errorf("create Churnless ReplicaSet: spec.selector is required")
+	}
 	replicas := int32(0)
 	selector := workload.Spec.Selector.DeepCopy()
 	if selector.MatchLabels == nil {
@@ -274,12 +283,8 @@ func deploymentParallelism(
 	if deployment.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
 		return replicas, nil
 	}
-	maxUnavailable := intstr.FromString("25%")
-	if deployment.Spec.Strategy.RollingUpdate != nil &&
-		deployment.Spec.Strategy.RollingUpdate.MaxUnavailable != nil {
-		maxUnavailable = *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable
-	}
-	maximum, err := intstr.GetScaledValueFromIntOrPercent(&maxUnavailable, replicas, false)
+	maxSurge, maxUnavailable := deploymentFenceposts(deployment)
+	_, maximum, err := kubecompat.ResolveFenceposts(maxSurge, maxUnavailable, int32(replicas))
 	if err != nil {
 		return 0, fmt.Errorf("calculate maxUnavailable: %w", err)
 	}
@@ -291,7 +296,7 @@ func deploymentParallelism(
 	if maximum == 0 && unavailable == 0 {
 		return 1, nil
 	}
-	return max(maximum-unavailable, 0), nil
+	return max(int(maximum)-unavailable, 0), nil
 }
 
 func (r *DeploymentReconciler) rollout(
@@ -356,6 +361,21 @@ func rollingLimits(
 	deployment *appsv1alpha1.Deployment,
 	replicas int32,
 ) (int32, int32, error) {
+	maxSurgeValue, maxUnavailableValue := deploymentFenceposts(deployment)
+	maxSurge, maxUnavailable, err := kubecompat.ResolveFenceposts(
+		maxSurgeValue,
+		maxUnavailableValue,
+		replicas,
+	)
+	if err != nil {
+		return 0, 0, fmt.Errorf("resolve rolling update fenceposts: %w", err)
+	}
+	return maxSurge, min(maxUnavailable, replicas), nil
+}
+
+func deploymentFenceposts(
+	deployment *appsv1alpha1.Deployment,
+) (*intstr.IntOrString, *intstr.IntOrString) {
 	surge := intstr.FromString("25%")
 	unavailable := intstr.FromString("25%")
 	if deployment.Spec.Strategy.RollingUpdate != nil {
@@ -366,15 +386,7 @@ func rollingLimits(
 			unavailable = *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable
 		}
 	}
-	maxSurge, err := intstr.GetScaledValueFromIntOrPercent(&surge, int(replicas), true)
-	if err != nil {
-		return 0, 0, fmt.Errorf("calculate maxSurge: %w", err)
-	}
-	maxUnavailable, err := intstr.GetScaledValueFromIntOrPercent(&unavailable, int(replicas), false)
-	if err != nil {
-		return 0, 0, fmt.Errorf("calculate maxUnavailable: %w", err)
-	}
-	return int32(maxSurge), min(int32(maxUnavailable), replicas), nil
+	return &surge, &unavailable
 }
 
 func (r *DeploymentReconciler) scaleReplicaSet(
@@ -434,20 +446,27 @@ func (r *DeploymentReconciler) updateDeploymentStatus(
 	}
 	var status appsv1.DeploymentStatus
 	status.ObservedGeneration = workload.Generation
+	status.CollisionCount = workload.Status.CollisionCount
+	var terminating int32
 	for i := range replicaSets {
 		status.Replicas += replicaSets[i].Status.Replicas
 		status.ReadyReplicas += replicaSets[i].Status.ReadyReplicas
 		status.AvailableReplicas += replicaSets[i].Status.AvailableReplicas
+		if replicaSets[i].Status.TerminatingReplicas != nil {
+			terminating += *replicaSets[i].Status.TerminatingReplicas
+		}
 	}
-	if current.Status.InPlace != nil {
-		status.UpdatedReplicas = current.Status.InPlace.UpdatedReplicas
+	if terminating > 0 {
+		status.TerminatingReplicas = &terminating
 	}
-	status.UnavailableReplicas = max(desiredReplicas(workload.Spec.Replicas)-status.AvailableReplicas, 0)
+	progress := observedInPlaceStatus(current)
+	status.UpdatedReplicas = progress.UpdatedReplicas
+	status.UnavailableReplicas = max(status.Replicas-status.AvailableReplicas, 0)
 	status.Conditions = deploymentConditions(workload, status)
 	result := appsv1alpha1.DeploymentStatus{
 		DeploymentStatus: status,
 		Selector:         selector,
-		InPlace:          current.Status.InPlace.DeepCopy(),
+		InPlace:          progress,
 	}
 	if apiequality.Semantic.DeepEqual(workload.Status, result) {
 		return nil
@@ -505,10 +524,18 @@ func deploymentConditions(
 		progressingCondition.Reason = "NewReplicaSetAvailable"
 		progressingCondition.Message = "Deployment rollout is complete"
 	}
-	return []appsv1.DeploymentCondition{
+	result := make([]appsv1.DeploymentCondition, 0, len(workload.Status.Conditions)+2)
+	for i := range workload.Status.Conditions {
+		if workload.Status.Conditions[i].Type != appsv1.DeploymentAvailable &&
+			workload.Status.Conditions[i].Type != appsv1.DeploymentProgressing {
+			result = append(result, workload.Status.Conditions[i])
+		}
+	}
+	return append(
+		result,
 		preserveConditionTime(workload.Status.Conditions, availableCondition),
 		preserveConditionTime(workload.Status.Conditions, progressingCondition),
-	}
+	)
 }
 
 func preserveConditionTime(
@@ -541,19 +568,41 @@ func deploymentComplete(
 	replicaSets []*appsv1alpha1.ReplicaSet,
 ) bool {
 	desired := desiredReplicas(workload.Spec.Replicas)
+	progress := observedInPlaceStatus(current)
 	return totalOldReplicas(current, replicaSets) == 0 &&
 		desiredReplicas(current.Spec.Replicas) == desired &&
-		current.Status.InPlace != nil &&
-		current.Status.InPlace.UpdatedReplicas == desired &&
-		current.Status.InPlace.ReadyUpdatedReplicas == desired &&
+		progress.UpdatedReplicas == desired &&
+		progress.ReadyUpdatedReplicas == desired &&
 		current.Status.AvailableReplicas == desired
+}
+
+func observedInPlaceStatus(
+	replicaSet *appsv1alpha1.ReplicaSet,
+) *appsv1alpha1.InPlaceUpdateStatus {
+	revision := imageRevision(&replicaSet.Spec.Template)
+	if replicaSet.Status.ObservedGeneration < replicaSet.Generation ||
+		replicaSet.Status.InPlace == nil ||
+		replicaSet.Status.InPlace.Revision != revision {
+		return &appsv1alpha1.InPlaceUpdateStatus{Revision: revision}
+	}
+	return replicaSet.Status.InPlace.DeepCopy()
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Deployment{}).
 		Owns(&appsv1alpha1.ReplicaSet{}).
 		Named("deployment").
 		Complete(r)
+}
+
+func (r *DeploymentReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }

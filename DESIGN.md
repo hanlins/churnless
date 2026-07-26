@@ -58,6 +58,7 @@ object has exactly one authoritative controller:
 | --- | --- |
 | Churnless Deployment | Chooses structural revisions, creates and scales Churnless ReplicaSets, applies rollout strategy, and aggregates status. |
 | Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, updates Pod images in place, and reports status. |
+| Admission webhooks | Apply and validate the native workload semantics that CRD schemas do not inherit from built-in API storage. |
 | kubelet | Observes the patched Pod image fields and restarts the affected containers. |
 
 Desired state flows only downward through this chain. Status flows upward. A
@@ -87,6 +88,15 @@ status:
 
 `status.selector` backs the standard `/scale` subresource. HPA targets the
 Churnless GVK directly and writes `spec.replicas` through that subresource.
+Unlike the built-in Deployment REST storage, generic CRD scale storage cannot
+derive a selector string from the structured `spec.selector`; the explicit
+status field is therefore required by the CRD's `labelSelectorPath`.
+
+`ReplicaSet.status.inPlace` is the child controller's image-specific progress
+contract. The Deployment consumes it only when its `revision` matches the
+ReplicaSet template and its `observedGeneration` is current. The Deployment
+status copies that fresh progress for user-facing observability; it is not
+desired state and is never used in place of the ReplicaSet spec.
 
 API shape and behavior are separate compatibility requirements:
 
@@ -98,6 +108,33 @@ API shape and behavior are separate compatibility requirements:
 4. New compatibility work requires tests derived from the corresponding native
    behavior.
 5. Deliberate divergences must be visible in status or documentation.
+
+## Upstream compatibility layer
+
+Kubernetes publishes `k8s.io/api` and `k8s.io/apimachinery` as staging modules,
+but its complete apps defaulting, apps validation, and controller helpers live
+in the non-staging `k8s.io/kubernetes` module. Churnless deliberately imports
+those upstream packages behind `internal/kubecompat`, pins every Kubernetes
+module to the same `v1.36` release line, and exposes only the small interface
+needed by its webhooks and controllers.
+
+The compatibility layer delegates directly to upstream Kubernetes for:
+
+- Covering Deployment and ReplicaSet defaults, including nested Pod templates.
+- Deployment, ReplicaSet, selector, strategy, and full Pod-template validation.
+- RollingUpdate fencepost calculation.
+- Pod readiness and availability calculation.
+- Native scale-down preference.
+
+Only behavior that Kubernetes keeps controller-local and unexported, currently
+ReplicaSet slow-start batching and its 500-Pod burst limit, is mirrored locally
+with an upstream source reference and focused tests. Importing the non-staging
+module is an intentional dependency tradeoff: it is less stable as a Go API,
+but avoids maintaining a partial fork of workload admission behavior.
+
+Server-side dry-run tests compare selected Churnless admission behavior with
+the native GVK. The native API server is a test oracle, not a runtime
+dependency and not a shadow controller.
 
 ## Revision model
 
@@ -150,6 +187,11 @@ The ReplicaSet:
 5. Considers a Pod complete only when its spec, kubelet-observed image status,
    and readiness all match the desired revision.
 
+ReplicaSet progress is generation-fenced. A Deployment treats progress as zero
+until the ReplicaSet has observed its current spec generation and reported the
+matching image revision. This prevents an image patch from temporarily
+presenting stale completion status.
+
 Scaling and self-healing always create Pods from the latest ReplicaSet
 template. Those operations may create a new Pod and therefore do not promise
 identity preservation.
@@ -165,6 +207,10 @@ Every controller change must preserve these invariants:
 - Structural template changes use a distinct ReplicaSet identity.
 - A replacement Pod starts with the latest desired image revision.
 - Reconciliation is idempotent and safe after partial progress or restart.
+- Pod adoption re-reads the ReplicaSet from the API server and verifies its UID
+  and deletion state before taking ownership.
+- Replica-count decisions use uncached reads so a fast requeue cannot create
+  another batch from stale informer state.
 - Selectors determine Pod membership; unowned matching Pods may be adopted and
   controlled Pods that stop matching are released.
 - Status reflects observed objects and never substitutes for desired state.
@@ -179,8 +225,9 @@ The target is behavioral parity for supported native Deployment and ReplicaSet
 manifests, with in-place image rollout as the intentional difference. The
 current `v1alpha1` implementation still has known gaps:
 
-- CRDs do not automatically inherit all built-in admission defaults and
-  validation.
+- Webhook behavior uses the feature-gate defaults compiled into the pinned
+  Kubernetes library; it cannot discover different feature-gate settings or
+  unrelated admission plugins configured on the hosting API server.
 - Stock `kubectl rollout` does not discover the custom GVK.
 - Image revisions reuse one ReplicaSet, so they are not separate ReplicaSet
   history entries.
@@ -206,14 +253,16 @@ The acceptance suite must continue to verify:
 - Stable Pod name, UID, and IP during a successful image-only rollout.
 - Structural changes create a different ReplicaSet.
 - `/scale` changes replica count and newly created Pods use the latest image.
+- `/scale` exposes the selector string and a real HPA can change replicas.
+- Deployment and ReplicaSet defaults, plus critical invalid-selector behavior,
+  match their native GVKs under server-side dry-run.
 
 Run:
 
 ```sh
-make manifests generate
 make test
 make lint
-CERT_MANAGER_INSTALL_SKIP=true make test-e2e
+make test-e2e
 ```
 
 ## Rules for evolving the design

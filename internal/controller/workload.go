@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
+	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
 const revisionAnnotation = "apps.churnless.io/image-revision"
@@ -223,21 +224,11 @@ func podContainersHaveImages(current, desired []corev1.Container) bool {
 }
 
 func podReadyAndObserved(pod *corev1.Pod, template *corev1.PodTemplateSpec) bool {
-	if !isPodReady(pod) {
+	if !kubecompat.IsPodReady(pod) {
 		return false
 	}
 	return statusesHaveImages(pod.Status.InitContainerStatuses, template.Spec.InitContainers) &&
 		statusesHaveImages(pod.Status.ContainerStatuses, template.Spec.Containers)
-}
-
-func isPodReady(pod *corev1.Pod) bool {
-	for i := range pod.Status.Conditions {
-		condition := pod.Status.Conditions[i]
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
 
 func statusesHaveImages(statuses []corev1.ContainerStatus, desired []corev1.Container) bool {

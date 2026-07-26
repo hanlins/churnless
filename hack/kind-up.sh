@@ -13,6 +13,8 @@ image="${KIND_IMAGE:-example.com/churnless:v0.0.1}"
 timeout="${KIND_TIMEOUT:-5m}"
 wait_seconds="${KIND_WAIT_SECONDS:-300}"
 context="kind-${cluster}"
+cert_manager_version="${CERT_MANAGER_VERSION:-v1.20.2}"
+metrics_server_version="${METRICS_SERVER_VERSION:-v0.8.1}"
 
 require() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -40,6 +42,40 @@ if [[ "${cluster_exists}" == "false" ]]; then
 else
   echo "Reusing Kind cluster ${cluster}..."
   "${kind_bin}" export kubeconfig --name "${cluster}"
+fi
+
+if ! "${kubectl_bin}" --context "${context}" get \
+  crd/certificates.cert-manager.io >/dev/null 2>&1; then
+  echo "Installing cert-manager ${cert_manager_version} for admission webhooks..."
+  "${kubectl_bin}" --context "${context}" apply -f \
+    "https://github.com/cert-manager/cert-manager/releases/download/${cert_manager_version}/cert-manager.yaml"
+fi
+for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
+  "${kubectl_bin}" --context "${context}" wait \
+    --for=condition=Available \
+    "deployment/${deployment}" \
+    --namespace cert-manager \
+    --timeout="${timeout}"
+done
+
+if [[ "${INSTALL_METRICS_SERVER:-true}" == "true" ]]; then
+  echo "Installing Metrics Server ${metrics_server_version} for HPA testing..."
+  "${kubectl_bin}" --context "${context}" apply -f \
+    "https://github.com/kubernetes-sigs/metrics-server/releases/download/${metrics_server_version}/components.yaml"
+  metrics_args="$("${kubectl_bin}" --context "${context}" -n kube-system get \
+    deployment/metrics-server \
+    -o jsonpath='{.spec.template.spec.containers[0].args[*]}')"
+  if [[ "${metrics_args}" != *"--kubelet-insecure-tls"* ]]; then
+    "${kubectl_bin}" --context "${context}" -n kube-system patch \
+      deployment/metrics-server \
+      --type=json \
+      -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+  fi
+  "${kubectl_bin}" --context "${context}" wait \
+    --for=condition=Available \
+    deployment/metrics-server \
+    --namespace kube-system \
+    --timeout="${timeout}"
 fi
 
 architecture="$("${container_tool}" info --format '{{.Architecture}}')"
@@ -80,6 +116,22 @@ make manifests generate
 "${kubectl_bin}" --context "${context}" -n churnless-system rollout status \
   deployment/churnless-controller-manager \
   --timeout="${timeout}"
+
+webhook_ready=false
+for ((attempt = 0; attempt < wait_seconds; attempt++)); do
+  ca_bundle="$("${kubectl_bin}" --context "${context}" get \
+    validatingwebhookconfiguration/churnless-validating-webhook-configuration \
+    -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null || true)"
+  if [[ -n "${ca_bundle}" ]]; then
+    webhook_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${webhook_ready}" == "false" ]]; then
+  echo "Timed out waiting for the admission webhook CA bundle" >&2
+  exit 1
+fi
 
 echo "Deploying the sample custom Deployment..."
 "${kubectl_bin}" --context "${context}" apply \

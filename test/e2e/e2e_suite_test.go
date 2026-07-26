@@ -36,6 +36,8 @@ var (
 	managerImage = "example.com/churnless:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
+	// shouldCleanupMetricsServer tracks whether Metrics Server was installed by this suite.
+	shouldCleanupMetricsServer = false
 )
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
@@ -66,9 +68,11 @@ var _ = BeforeSuite(func() {
 
 	configureKubectlKubeRC()
 	setupCertManager()
+	setupMetricsServer()
 })
 
 var _ = AfterSuite(func() {
+	teardownMetricsServer()
 	teardownCertManager()
 })
 
@@ -85,6 +89,20 @@ func configureKubectlKubeRC() {
 	} else {
 		_, _ = fmt.Fprintf(GinkgoWriter, "kubectl kuberc enabled (KUBECTL_KUBERC=true)\n")
 	}
+}
+
+func setupMetricsServer() {
+	shouldCleanupMetricsServer = true
+	By("installing Metrics Server for the HPA compatibility test")
+	Expect(utils.InstallMetricsServer()).To(Succeed(), "Failed to install Metrics Server")
+}
+
+func teardownMetricsServer() {
+	if !shouldCleanupMetricsServer {
+		return
+	}
+	By("uninstalling Metrics Server")
+	utils.UninstallMetricsServer()
 }
 
 // setupCertManager installs CertManager if needed for webhook tests.

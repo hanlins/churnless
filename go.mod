@@ -6,11 +6,12 @@ toolchain go1.26.5
 
 require (
 	github.com/distribution/reference v0.6.0
-	github.com/onsi/ginkgo/v2 v2.27.4
-	github.com/onsi/gomega v1.39.0
+	github.com/onsi/ginkgo/v2 v2.28.1
+	github.com/onsi/gomega v1.39.1
 	k8s.io/api v0.36.0
 	k8s.io/apimachinery v0.36.0
 	k8s.io/client-go v0.36.0
+	k8s.io/kubernetes v1.36.0
 	sigs.k8s.io/controller-runtime v0.24.1
 )
 
@@ -38,7 +39,7 @@ require (
 	github.com/google/cel-go v0.26.0 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
+	github.com/google/pprof v0.0.0-20260115054156-294ebfa9ad83 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -54,6 +55,7 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
@@ -92,8 +94,11 @@ require (
 	k8s.io/apiextensions-apiserver v0.36.0 // indirect
 	k8s.io/apiserver v0.36.0 // indirect
 	k8s.io/component-base v0.36.0 // indirect
+	k8s.io/component-helpers v0.36.0 // indirect
+	k8s.io/controller-manager v0.36.0 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
+	k8s.io/kubelet v0.36.0 // indirect
 	k8s.io/streaming v0.36.0 // indirect
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 // indirect
@@ -101,4 +106,43 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
+)
+
+// k8s.io/kubernetes is developed with local staging-module replacements.
+// Reproduce those replacements with the matching published v0.36 modules so
+// downstream Go tooling sees a complete, version-aligned module graph.
+replace (
+	k8s.io/api v0.0.0 => k8s.io/api v0.36.0
+	k8s.io/apiextensions-apiserver v0.0.0 => k8s.io/apiextensions-apiserver v0.36.0
+	k8s.io/apimachinery v0.0.0 => k8s.io/apimachinery v0.36.0
+	k8s.io/apiserver v0.0.0 => k8s.io/apiserver v0.36.0
+	k8s.io/cli-runtime v0.0.0 => k8s.io/cli-runtime v0.36.0
+	k8s.io/client-go v0.0.0 => k8s.io/client-go v0.36.0
+	k8s.io/cloud-provider v0.0.0 => k8s.io/cloud-provider v0.36.0
+	k8s.io/cluster-bootstrap v0.0.0 => k8s.io/cluster-bootstrap v0.36.0
+	k8s.io/code-generator v0.0.0 => k8s.io/code-generator v0.36.0
+	k8s.io/component-base v0.0.0 => k8s.io/component-base v0.36.0
+	k8s.io/component-helpers v0.0.0 => k8s.io/component-helpers v0.36.0
+	k8s.io/controller-manager v0.0.0 => k8s.io/controller-manager v0.36.0
+	k8s.io/cri-api v0.0.0 => k8s.io/cri-api v0.36.0
+	k8s.io/cri-client v0.0.0 => k8s.io/cri-client v0.36.0
+	k8s.io/cri-streaming v0.0.0 => k8s.io/cri-streaming v0.36.0
+	k8s.io/csi-translation-lib v0.0.0 => k8s.io/csi-translation-lib v0.36.0
+	k8s.io/dynamic-resource-allocation v0.0.0 => k8s.io/dynamic-resource-allocation v0.36.0
+	k8s.io/endpointslice v0.0.0 => k8s.io/endpointslice v0.36.0
+	k8s.io/externaljwt v0.0.0 => k8s.io/externaljwt v0.36.0
+	k8s.io/kms v0.0.0 => k8s.io/kms v0.36.0
+	k8s.io/kube-aggregator v0.0.0 => k8s.io/kube-aggregator v0.36.0
+	k8s.io/kube-controller-manager v0.0.0 => k8s.io/kube-controller-manager v0.36.0
+	k8s.io/kube-proxy v0.0.0 => k8s.io/kube-proxy v0.36.0
+	k8s.io/kube-scheduler v0.0.0 => k8s.io/kube-scheduler v0.36.0
+	k8s.io/kubectl v0.0.0 => k8s.io/kubectl v0.36.0
+	k8s.io/kubelet v0.0.0 => k8s.io/kubelet v0.36.0
+	k8s.io/metrics v0.0.0 => k8s.io/metrics v0.36.0
+	k8s.io/mount-utils v0.0.0 => k8s.io/mount-utils v0.36.0
+	k8s.io/pod-security-admission v0.0.0 => k8s.io/pod-security-admission v0.36.0
+	k8s.io/sample-apiserver v0.0.0 => k8s.io/sample-apiserver v0.36.0
+	k8s.io/sample-cli-plugin v0.0.0 => k8s.io/sample-cli-plugin v0.36.0
+	k8s.io/sample-controller v0.0.0 => k8s.io/sample-controller v0.36.0
+	k8s.io/streaming v0.0.0 => k8s.io/streaming v0.36.0
 )

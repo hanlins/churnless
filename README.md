@@ -188,28 +188,65 @@ For scripts, use fully qualified resource names such as
 HPA can target the Churnless GVK directly through its standard `/scale`
 subresource.
 
-## Take over and hand off a Deployment
+## Explore an existing Deployment and fall back
 
-Start with a stable, fully rolled-out Deployment. Annotate a native Deployment
-to move it to Churnless:
+Churnless uses one desired-controller annotation for the whole workflow:
+`churnless.io/controller=churnless|native`.
 
-```sh
-kubectl annotate deployment.apps/web churnless.io/takeover=true
-```
-
-The controller creates `deployment.churnless.io/web`, transfers the live Pods
-to a Churnless ReplicaSet, and removes the native Deployment and ReplicaSets.
-To hand the same workload back to Kubernetes:
+Before starting, wait for the native Deployment to finish its rollout and
+pause any GitOps or other automation that would recreate the deleted source
+GVK or revert dependent references. Optionally record current Pod identity:
 
 ```sh
-kubectl annotate deployment.churnless.io/web churnless.io/handoff=true
+kubectl rollout status deployment.apps/web
+kubectl get pods -l app=web \
+  -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP'
 ```
 
-The reverse transfer creates `deployment.apps/web` and moves Pod ownership
-back to its native ReplicaSet. The source must be complete, the same-name
-target GVK must not already exist, and the source spec must stay unchanged
-during migration. Temporary target Pods can briefly increase Pod and resource
-counts; ready source Pod identity is retained when Kubernetes permits it.
+Move the workload to Churnless:
+
+```sh
+kubectl annotate deployment.apps/web \
+  churnless.io/controller=churnless --overwrite
+kubectl wait --for=delete deployment.apps/web --timeout=5m
+kubectl wait --for=condition=Available \
+  deployment.churnless.io/web --timeout=5m
+```
+
+The controller creates `deployment.churnless.io/web`, transfers the live Pods,
+and leaves `churnless.io/controller=churnless` on the surviving object. Inspect
+progress or diagnose a blocked migration with:
+
+```sh
+kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
+kubectl get events --field-selector involvedObject.name=web \
+  --sort-by=.lastTimestamp
+```
+
+Return to the native controller at any time:
+
+```sh
+kubectl annotate deployment.churnless.io/web \
+  churnless.io/controller=native --overwrite
+kubectl wait --for=delete deployment.churnless.io/web --timeout=5m
+kubectl get deployment.apps/web
+```
+
+When the Churnless rollout is healthy, handoff retains ready Pod identity when
+Kubernetes permits it. If the Churnless rollout is unhealthy, recovery does
+not wait for it: Churnless first creates a native ReplicaSet with the desired
+Pod count, retargets supported dependents, and then removes the Churnless
+hierarchy. Recovery prioritizes native ownership over Pod identity, and the
+native Deployment may remain unhealthy until its desired spec is fixed.
+
+If takeover is still in progress and the native source exists, setting
+`churnless.io/controller=native` on either Deployment cancels the takeover and
+keeps native Kubernetes authoritative. If native source deletion has already
+started, the controller finishes the ownership cutover and proceeds directly
+into recovery handoff; the same fallback command remains effective. During any
+migration, the source spec must stay unchanged and a same-name target GVK must
+not be created manually. Temporary target Pods can briefly increase Pod and
+resource counts.
 
 This migration currently supports Deployments only. Before cutover, the
 controller automatically retargets HorizontalPodAutoscaler,

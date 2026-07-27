@@ -18,12 +18,14 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,7 +49,13 @@ var _ = Describe("Migration Controller", func() {
 	})
 
 	AfterEach(func() {
-		for _, name := range []string{"takeover-test", "handoff-test"} {
+		for _, name := range []string{
+			"takeover-test",
+			"handoff-test",
+			"recovery-test",
+			"cancel-test",
+			"adoption-test",
+		} {
 			deletePodsWithLabel(ctx, namespace, name)
 			deleteIfPresent(ctx, &autoscalingv2.HorizontalPodAutoscaler{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -81,10 +89,12 @@ var _ = Describe("Migration Controller", func() {
 		replicas := int32(1)
 		source := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        name,
-				Namespace:   namespace,
-				Labels:      map[string]string{"example.com/workload": "takeover"},
-				Annotations: map[string]string{takeoverAnnotation: annotationEnabledValue},
+				Name:      name,
+				Namespace: namespace,
+				Labels:    map[string]string{"example.com/workload": "takeover"},
+				Annotations: map[string]string{
+					controllerAnnotation: churnlessControllerValue,
+				},
 			},
 			Spec: appsv1.DeploymentSpec{
 				Replicas: &replicas,
@@ -129,8 +139,9 @@ var _ = Describe("Migration Controller", func() {
 
 		Expect(k8sClient.Get(ctx, key, &target)).To(Succeed())
 		Expect(target.Labels).To(Equal(source.Labels))
-		Expect(target.Annotations).NotTo(HaveKey(takeoverAnnotation))
+		Expect(target.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
 		Expect(target.Annotations[migrationSourceAnnotation]).To(Equal(nativeDeploymentSource))
+		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModePreserve))
 		Expect(target.Annotations[migrationIDAnnotation]).To(Equal(string(source.UID)))
 		Expect(target.Annotations[migrationPhaseAnnotation]).To(Equal(migrationPhaseWarming))
 		Expect(target.Annotations[migrationOriginalPausedAnnotation]).To(Equal(annotationEnabledValue))
@@ -149,10 +160,12 @@ var _ = Describe("Migration Controller", func() {
 		replicas := int32(1)
 		source := &appsv1alpha1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        name,
-				Namespace:   namespace,
-				Labels:      map[string]string{"example.com/workload": "handoff"},
-				Annotations: map[string]string{handoffAnnotation: annotationEnabledValue},
+				Name:      name,
+				Namespace: namespace,
+				Labels:    map[string]string{"example.com/workload": "handoff"},
+				Annotations: map[string]string{
+					controllerAnnotation: nativeControllerValue,
+				},
 			},
 			Spec: appsv1alpha1.DeploymentSpec{DeploymentSpec: appsv1.DeploymentSpec{
 				Replicas: &replicas,
@@ -206,8 +219,9 @@ var _ = Describe("Migration Controller", func() {
 		var target appsv1.Deployment
 		Expect(k8sClient.Get(ctx, key, &target)).To(Succeed())
 		Expect(target.Labels).To(Equal(source.Labels))
-		Expect(target.Annotations).NotTo(HaveKey(handoffAnnotation))
+		Expect(target.Annotations[controllerAnnotation]).To(Equal(nativeControllerValue))
 		Expect(target.Annotations[migrationSourceAnnotation]).To(Equal(churnlessDeploymentSource))
+		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModePreserve))
 		Expect(target.Annotations[migrationIDAnnotation]).To(Equal(string(source.UID)))
 		Expect(target.Annotations[migrationOriginalPausedAnnotation]).To(Equal(annotationEnabledValue))
 		Expect(target.Spec.Paused).To(BeFalse())
@@ -215,6 +229,104 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Spec.Template.Labels).To(Equal(source.Spec.Template.Labels))
 		Expect(target.Spec.Template.Spec.Containers[0].Image).
 			To(Equal(source.Spec.Template.Spec.Containers[0].Image))
+	})
+
+	It("starts recovery handoff before an unhealthy Churnless rollout completes", func() {
+		const name = "recovery-test"
+		replicas := int32(1)
+		source := &appsv1alpha1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					controllerAnnotation: nativeControllerValue,
+				},
+			},
+			Spec: appsv1alpha1.DeploymentSpec{DeploymentSpec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
+				Template: podTemplate(name, image),
+			}},
+		}
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		var target appsv1.Deployment
+		Expect(k8sClient.Get(ctx, key, &target)).To(Succeed())
+		Expect(target.Annotations[controllerAnnotation]).To(Equal(nativeControllerValue))
+		Expect(target.Annotations[migrationSourceAnnotation]).To(Equal(churnlessDeploymentSource))
+		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModeRecovery))
+		Expect(target.Spec.Template.Labels).To(Equal(source.Spec.Template.Labels))
+		Expect(target.Spec.Template.Spec.Containers[0].Image).
+			To(Equal(source.Spec.Template.Spec.Containers[0].Image))
+	})
+
+	It("cancels an in-progress takeover when native ownership is requested", func() {
+		const name = "cancel-test"
+		replicas := int32(1)
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		source := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					controllerAnnotation: churnlessControllerValue,
+				},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
+				Template: podTemplate(name, image),
+			},
+		}
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		target := &appsv1alpha1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					controllerAnnotation:      nativeControllerValue,
+					migrationIDAnnotation:     string(source.UID),
+					migrationModeAnnotation:   migrationModePreserve,
+					migrationSourceAnnotation: nativeDeploymentSource,
+				},
+			},
+			Spec: appsv1alpha1.DeploymentSpec{DeploymentSpec: *source.Spec.DeepCopy()},
+		}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+					APIVersion: appsv1alpha1.GroupVersion.String(),
+					Kind:       deploymentKind,
+					Name:       name,
+				},
+				MinReplicas: &replicas,
+				MaxReplicas: 2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, hpa)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			g.Expect(err).NotTo(HaveOccurred())
+			err = k8sClient.Get(ctx, key, target)
+			g.Expect(err == nil || apierrors.IsNotFound(err)).To(BeTrue())
+			if err == nil {
+				g.Expect(target.DeletionTimestamp.IsZero()).To(BeFalse())
+			}
+			g.Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+			g.Expect(source.Annotations[controllerAnnotation]).To(Equal(nativeControllerValue))
+			g.Expect(k8sClient.Get(ctx, key, hpa)).To(Succeed())
+			g.Expect(hpa.Spec.ScaleTargetRef.APIVersion).
+				To(Equal(appsv1.SchemeGroupVersion.String()))
+		}, 10*time.Second, 100*time.Millisecond).Should(Succeed())
 	})
 
 	It("marks source Pods for selector-compatible preferential adoption", func() {
@@ -247,5 +359,46 @@ var _ = Describe("Migration Controller", func() {
 		Expect(pod.Annotations[migrationIDAnnotation]).To(Equal("migration-uid"))
 		Expect(pod.Annotations[migrationRoleAnnotation]).To(Equal(migrationRoleSource))
 		Expect(pod.Annotations[corev1.PodDeletionCost]).To(Equal(sourceDeletionCost))
+	})
+
+	It("explicitly adopts orphaned migration Pods into the target ReplicaSet", func() {
+		const name = "adoption-test"
+		replicas := int32(1)
+		replicaSet := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: appsv1.ReplicaSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
+				Template: podTemplate(name, image),
+			},
+		}
+		Expect(k8sClient.Create(ctx, replicaSet)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(replicaSet), replicaSet)).To(Succeed())
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Labels:    map[string]string{appLabel: name},
+				Annotations: map[string]string{
+					migrationIDAnnotation:   "migration-uid",
+					migrationRoleAnnotation: migrationRoleSource,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "main", Image: image}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+		changed, err := reconciler.adoptMigrationPods(
+			ctx,
+			namespace,
+			"migration-uid",
+			nativePodAdoptionTargets([]*appsv1.ReplicaSet{replicaSet}),
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(changed).To(BeTrue())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+		Expect(metav1.IsControlledBy(pod, replicaSet)).To(BeTrue())
 	})
 })

@@ -600,14 +600,11 @@ spec:
 			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
 
 			By("requesting Churnless takeover with an annotation")
-			cmd := exec.Command(
-				"kubectl",
-				"annotate",
-				"deployment.apps/"+workload,
-				"churnless.io/takeover=true",
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(requestController(
+				"deployment.apps",
+				workload,
+				"churnless",
+			)).To(Succeed())
 			takenOverPods := eventuallyOwnedDeploymentPods(
 				workload,
 				replicas,
@@ -615,6 +612,11 @@ spec:
 				appsv1alpha1.GroupVersion.String(),
 			)
 			expectPodIdentityRetained(nativePods, takenOverPods)
+			eventuallyControllerAnnotation(
+				"deployment.churnless.io",
+				workload,
+				"churnless",
+			)
 			eventuallyHPATarget(workload, appsv1alpha1.GroupVersion.String())
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment.apps/"+workload)
@@ -623,14 +625,11 @@ spec:
 			}).Should(Succeed())
 
 			By("requesting emergency handoff to the native controller")
-			cmd = exec.Command(
-				"kubectl",
-				"annotate",
-				"deployment.churnless.io/"+workload,
-				"churnless.io/handoff=true",
-			)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(requestController(
+				"deployment.churnless.io",
+				workload,
+				"native",
+			)).To(Succeed())
 			handedOffPods := eventuallyOwnedDeploymentPods(
 				workload,
 				replicas,
@@ -638,12 +637,79 @@ spec:
 				appsv1.SchemeGroupVersion.String(),
 			)
 			expectPodIdentityRetained(takenOverPods, handedOffPods)
+			eventuallyControllerAnnotation("deployment.apps", workload, "native")
 			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
 				_, err := utils.Run(cmd)
 				g.Expect(err).To(HaveOccurred())
 			}).Should(Succeed())
+		})
+
+		It("should recover native ownership from an unhealthy Churnless rollout", func() {
+			const (
+				workload = "migration-recovery"
+				image    = "nginx:1.28-alpine"
+				replicas = 2
+			)
+			DeferCleanup(func() {
+				for _, resource := range []string{
+					"deployment.apps/" + workload,
+					"deployment.churnless.io/" + workload,
+				} {
+					cmd := exec.Command("kubectl", "delete", resource, "--ignore-not-found")
+					_, _ = utils.Run(cmd)
+				}
+			})
+
+			By("taking over a healthy native Deployment")
+			Expect(applyMigrationDeployment(workload, replicas, image)).To(Succeed())
+			nativePods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			Expect(requestController(
+				"deployment.apps",
+				workload,
+				"churnless",
+			)).To(Succeed())
+			takenOverPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1alpha1.GroupVersion.String(),
+			)
+			expectPodIdentityRetained(nativePods, takenOverPods)
+
+			By("making the Churnless rollout unhealthy")
+			Expect(patchFailingReadinessProbe(workload, image)).To(Succeed())
+			eventuallyChurnlessDeploymentIncomplete(workload)
+
+			By("requesting recovery by the native controller")
+			Expect(requestController(
+				"deployment.churnless.io",
+				workload,
+				"native",
+			)).To(Succeed())
+			eventuallyControllerAnnotation("deployment.apps", workload, "native")
+			eventuallyMigrationEvent(workload, "RecoveryHandoffStarted")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+			}, 5*time.Minute, time.Second).Should(Succeed())
+
+			By("fixing the workload under native ownership")
+			Expect(removeNativeReadinessProbe(workload)).To(Succeed())
+			recoveredPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			Expect(retainedIdentities(takenOverPods, recoveredPods)).To(BeZero())
 		})
 
 		It("should enforce RollingUpdate availability and surge limits", func() {
@@ -1150,6 +1216,111 @@ spec:
 `, workload, workload, replicas, replicas)
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func requestController(resource, workload, controller string) error {
+	cmd := exec.Command(
+		"kubectl",
+		"annotate",
+		resource+"/"+workload,
+		"churnless.io/controller="+controller,
+		"--overwrite",
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func eventuallyControllerAnnotation(resource, workload, controller string) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			resource+"/"+workload,
+			"-o",
+			"jsonpath={.metadata.annotations.churnless\\.io/controller}",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(output).To(Equal(controller))
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func patchFailingReadinessProbe(workload, image string) error {
+	patch := fmt.Sprintf(
+		`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","readinessProbe":{"httpGet":{"path":"/churnless-not-ready","port":80},"periodSeconds":1}}]}}}}`,
+		image,
+	)
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.churnless.io/"+workload,
+		"--type=merge",
+		"-p",
+		patch,
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func eventuallyChurnlessDeploymentIncomplete(workload string) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"deployment.churnless.io/"+workload,
+			"-o",
+			"json",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var deployment appsv1alpha1.Deployment
+		g.Expect(json.Unmarshal([]byte(output), &deployment)).To(Succeed())
+		g.Expect(deployment.Status.ObservedGeneration).
+			To(BeNumerically(">=", deployment.Generation))
+		desired := int32(1)
+		if deployment.Spec.Replicas != nil {
+			desired = *deployment.Spec.Replicas
+		}
+		g.Expect(
+			deployment.Status.UpdatedReplicas != desired ||
+				deployment.Status.AvailableReplicas != desired,
+		).To(BeTrue())
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func eventuallyMigrationEvent(workload, reason string) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"events",
+			"--field-selector=involvedObject.name="+workload,
+			"-o",
+			"json",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var events corev1.EventList
+		g.Expect(json.Unmarshal([]byte(output), &events)).To(Succeed())
+		reasons := make([]string, 0, len(events.Items))
+		for i := range events.Items {
+			reasons = append(reasons, events.Items[i].Reason)
+		}
+		g.Expect(reasons).To(ContainElement(reason))
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func removeNativeReadinessProbe(workload string) error {
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.apps/"+workload,
+		"--type=json",
+		"-p",
+		`[{"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe"}]`,
+	)
 	_, err := utils.Run(cmd)
 	return err
 }

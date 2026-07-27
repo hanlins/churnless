@@ -33,6 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,7 +81,7 @@ func (r *DeploymentReconciler) Reconcile(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	revision := structuralRevision(&workload.Spec.Template)
+	revision := structuralRevision(&workload)
 	current := replicaSetForRevision(replicaSets, revision)
 	if workload.Spec.Paused && current == nil && len(replicaSets) > 0 {
 		current = newestReplicaSet(replicaSets)
@@ -163,10 +164,26 @@ func (r *DeploymentReconciler) listReplicaSets(
 	return result, nil
 }
 
-func structuralRevision(template *corev1.PodTemplateSpec) string {
-	copy := cleanTemplate(template)
-	clearImages(copy)
-	data, _ := json.Marshal(copy)
+func structuralRevision(workload *appsv1alpha1.Deployment) string {
+	copy := cleanTemplate(&workload.Spec.Template)
+	policy := mutablePodPolicyFor(workload.Annotations)
+	redeployToken := workload.Annotations[redeployAnnotation]
+	workloadRestartToken := workload.Annotations[kubectlRestartedAtAnnotation]
+	templateRestartToken := copy.Annotations[kubectlRestartedAtAnnotation]
+	policy.clearFromStructural(copy)
+	data, _ := json.Marshal(struct {
+		Template        *corev1.PodTemplateSpec `json:"template"`
+		ResourcePolicy  string                  `json:"resourcePolicy,omitempty"`
+		Redeploy        string                  `json:"redeploy,omitempty"`
+		WorkloadRestart string                  `json:"workloadRestart,omitempty"`
+		TemplateRestart string                  `json:"templateRestart,omitempty"`
+	}{
+		Template:        copy,
+		ResourcePolicy:  policy.resourcePolicy(),
+		Redeploy:        redeployToken,
+		WorkloadRestart: workloadRestartToken,
+		TemplateRestart: templateRestartToken,
+	})
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum[:5])
 }
@@ -232,6 +249,7 @@ func (r *DeploymentReconciler) createReplicaSet(
 			Template:        *template,
 		}},
 	}
+	mutablePodPolicyFor(workload.Annotations).applyResourcePolicy(replicaSet.Annotations)
 	if err := controllerutil.SetControllerReference(workload, replicaSet, r.Scheme); err != nil {
 		return nil, err
 	}
@@ -262,6 +280,7 @@ func (r *DeploymentReconciler) syncReplicaSet(
 		replicaSet.Annotations = map[string]string{}
 	}
 	replicaSet.Annotations[inPlaceParallelismAnnotation] = strconv.Itoa(parallelism)
+	mutablePodPolicyFor(workload.Annotations).applyResourcePolicy(replicaSet.Annotations)
 	if apiequality.Semantic.DeepEqual(before.Spec, replicaSet.Spec) &&
 		maps.Equal(before.Annotations, replicaSet.Annotations) {
 		return false, nil
@@ -288,10 +307,7 @@ func deploymentParallelism(
 	if err != nil {
 		return 0, fmt.Errorf("calculate maxUnavailable: %w", err)
 	}
-	available := int32(0)
-	for i := range replicaSets {
-		available += replicaSets[i].Status.AvailableReplicas
-	}
+	available := totalAvailableReplicas(replicaSets)
 	unavailable := max(replicas-int(available), 0)
 	if maximum == 0 && unavailable == 0 {
 		return 1, nil
@@ -311,7 +327,11 @@ func (r *DeploymentReconciler) rollout(
 				return r.scaleReplicaSet(ctx, replicaSets[i], 0)
 			}
 		}
-		if totalOldReplicas(current, replicaSets) == 0 {
+		oldPodsRunning, err := r.oldPodsRunning(ctx, workload, current, replicaSets)
+		if err != nil {
+			return false, err
+		}
+		if totalOldReplicas(current, replicaSets) == 0 && !oldPodsRunning {
 			return r.scaleReplicaSet(ctx, current, desiredReplicas(workload.Spec.Replicas))
 		}
 		return false, nil
@@ -416,7 +436,13 @@ func totalReplicaSpec(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
 func totalAvailableReplicas(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
 	var total int32
 	for i := range replicaSets {
-		total += replicaSets[i].Status.AvailableReplicas
+		// A ReplicaSet scale-down patch is visible before its controller
+		// updates status. Never spend the same stale available replica again
+		// on a fast Deployment requeue.
+		total += min(
+			replicaSets[i].Status.AvailableReplicas,
+			desiredReplicas(replicaSets[i].Spec.Replicas),
+		)
 	}
 	return total
 }
@@ -432,6 +458,76 @@ func totalOldReplicas(
 		}
 	}
 	return total
+}
+
+func totalOldObservedPods(
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) int32 {
+	var total int32
+	for i := range replicaSets {
+		if replicaSets[i].UID == current.UID {
+			continue
+		}
+		total += replicaSets[i].Status.Replicas
+		if replicaSets[i].Status.TerminatingReplicas != nil {
+			total += *replicaSets[i].Status.TerminatingReplicas
+		}
+	}
+	return total
+}
+
+// oldPodsRunning mirrors Kubernetes's Recreate policy: trust neither
+// ReplicaSet status nor its scale alone, because both can become visible before
+// a terminating Pod leaves the API. Terminal Pods cannot still run and do not
+// block the new revision.
+func (r *DeploymentReconciler) oldPodsRunning(
+	ctx context.Context,
+	workload *appsv1alpha1.Deployment,
+	current *appsv1alpha1.ReplicaSet,
+	replicaSets []*appsv1alpha1.ReplicaSet,
+) (bool, error) {
+	if totalOldObservedPods(current, replicaSets) > 0 {
+		return true, nil
+	}
+
+	oldReplicaSets := make(map[types.UID]struct{}, len(replicaSets))
+	for i := range replicaSets {
+		if replicaSets[i].UID != current.UID {
+			oldReplicaSets[replicaSets[i].UID] = struct{}{}
+		}
+	}
+	if len(oldReplicaSets) == 0 {
+		return false, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(workload.Spec.Selector)
+	if err != nil {
+		return false, fmt.Errorf("parse Deployment selector for Recreate rollout: %w", err)
+	}
+	var pods corev1.PodList
+	if err := r.reader().List(
+		ctx,
+		&pods,
+		client.InNamespace(workload.Namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	); err != nil {
+		return false, fmt.Errorf("list Pods for Recreate rollout: %w", err)
+	}
+	for i := range pods.Items {
+		owner := metav1.GetControllerOf(&pods.Items[i])
+		if owner == nil {
+			continue
+		}
+		if _, ok := oldReplicaSets[owner.UID]; !ok {
+			continue
+		}
+		if pods.Items[i].Status.Phase != corev1.PodFailed &&
+			pods.Items[i].Status.Phase != corev1.PodSucceeded {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *DeploymentReconciler) updateDeploymentStatus(
@@ -570,6 +666,7 @@ func deploymentComplete(
 	desired := desiredReplicas(workload.Spec.Replicas)
 	progress := observedInPlaceStatus(current)
 	return totalOldReplicas(current, replicaSets) == 0 &&
+		totalOldObservedPods(current, replicaSets) == 0 &&
 		desiredReplicas(current.Spec.Replicas) == desired &&
 		progress.UpdatedReplicas == desired &&
 		progress.ReadyUpdatedReplicas == desired &&
@@ -579,7 +676,7 @@ func deploymentComplete(
 func observedInPlaceStatus(
 	replicaSet *appsv1alpha1.ReplicaSet,
 ) *appsv1alpha1.InPlaceUpdateStatus {
-	revision := imageRevision(&replicaSet.Spec.Template)
+	revision := mutablePodPolicyFor(replicaSet.Annotations).revision(&replicaSet.Spec.Template)
 	if replicaSet.Status.ObservedGeneration < replicaSet.Generation ||
 		replicaSet.Status.InPlace == nil ||
 		replicaSet.Status.InPlace.Revision != revision {

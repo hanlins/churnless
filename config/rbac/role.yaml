@@ -16,6 +16,12 @@ rules:
   - patch
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods/resize
+  verbs:
+  - update
+- apiGroups:
   - apps
   resources:
   - deployments

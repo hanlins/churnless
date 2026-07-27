@@ -22,18 +22,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// InPlaceUpdateStatus describes the image revision applied directly to Pods.
+// InPlaceUpdateStatus describes mutable template fields applied directly to Pods.
 type InPlaceUpdateStatus struct {
-	// revision is a deterministic hash of the desired container images.
+	// revision is a deterministic hash of the desired in-place fields.
 	// +optional
 	Revision string `json:"revision,omitempty"`
 
-	// updatedReplicas is the number of Pods whose specs contain the desired images.
+	// updatedReplicas is the number of Pods whose specs contain the desired
+	// in-place fields.
 	// +optional
 	UpdatedReplicas int32 `json:"updatedReplicas,omitempty"`
 
 	// readyUpdatedReplicas is the number of updated Pods that are ready and
-	// observed by the kubelet with the desired images.
+	// whose runtime-observed fields have converged.
 	// +optional
 	ReadyUpdatedReplicas int32 `json:"readyUpdatedReplicas,omitempty"`
 }

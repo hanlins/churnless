@@ -20,6 +20,13 @@ CONTAINER_TOOL ?= docker
 KIND_CLUSTER ?= churnless
 KIND_IMAGE ?= example.com/churnless:v0.0.1
 E2E_KIND_CLUSTER ?= churnless-test-e2e
+BENCHMARK_KIND_CLUSTER ?= churnless-rollout-benchmark
+BENCHMARK_CONTEXT ?= kind-$(BENCHMARK_KIND_CLUSTER)
+BENCHMARK_REPLICAS ?= 100
+BENCHMARK_ITERATIONS ?= 3
+BENCHMARK_TIMEOUT ?= 10m
+BENCHMARK_OLD_IMAGE ?= registry.k8s.io/pause:3.9
+BENCHMARK_NEW_IMAGE ?= registry.k8s.io/pause:3.10
 
 # Build local tools with the same Go toolchain used by this module.
 PROJECT_GO_TOOLCHAIN ?= $(shell go env GOVERSION)
@@ -86,7 +93,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	}
 	@case "$$($(KIND) get clusters)" in \
 		*"$(E2E_KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(E2E_KIND_CLUSTER)' already exists. Skipping creation." ;; \
+			echo "Reusing Kind cluster '$(E2E_KIND_CLUSTER)'."; \
+			$(KIND) export kubeconfig --name $(E2E_KIND_CLUSTER) ;; \
 		*) \
 			echo "Creating Kind cluster '$(E2E_KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(E2E_KIND_CLUSTER) ;; \
@@ -100,6 +108,42 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(E2E_KIND_CLUSTER)
+
+.PHONY: benchmark-rollout
+benchmark-rollout: benchmark-rollout-setup ## Compare native and Churnless image rollouts in isolated Kind.
+	@$(MAKE) benchmark-rollout-run
+
+.PHONY: benchmark-rollout-setup
+benchmark-rollout-setup: ## Create/reuse the isolated benchmark cluster and preload workload images.
+	@INSTALL_METRICS_SERVER=false \
+		DEPLOY_SAMPLE=false \
+		KIND="$(KIND)" \
+		KUBECTL="$(KUBECTL)" \
+		CONTAINER_TOOL="$(CONTAINER_TOOL)" \
+		KIND_CLUSTER="$(BENCHMARK_KIND_CLUSTER)" \
+		KIND_IMAGE="$(KIND_IMAGE)" \
+		KIND_CONFIG="hack/kind-benchmark.yaml" \
+		./hack/kind-up.sh
+	$(CONTAINER_TOOL) pull "$(BENCHMARK_OLD_IMAGE)"
+	$(CONTAINER_TOOL) pull "$(BENCHMARK_NEW_IMAGE)"
+	"$(KIND)" load docker-image \
+		"$(BENCHMARK_OLD_IMAGE)" \
+		"$(BENCHMARK_NEW_IMAGE)" \
+		--name "$(BENCHMARK_KIND_CLUSTER)"
+
+.PHONY: benchmark-rollout-run
+benchmark-rollout-run: ## Run the rollout benchmark against BENCHMARK_CONTEXT.
+	go run ./test/benchmark \
+		-context "$(BENCHMARK_CONTEXT)" \
+		-replicas "$(BENCHMARK_REPLICAS)" \
+		-iterations "$(BENCHMARK_ITERATIONS)" \
+		-old-image "$(BENCHMARK_OLD_IMAGE)" \
+		-new-image "$(BENCHMARK_NEW_IMAGE)" \
+		-timeout "$(BENCHMARK_TIMEOUT)"
+
+.PHONY: benchmark-rollout-cleanup
+benchmark-rollout-cleanup: ## Delete only the dedicated rollout benchmark Kind cluster.
+	@"$(KIND)" delete cluster --name "$(BENCHMARK_KIND_CLUSTER)"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

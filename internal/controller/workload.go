@@ -21,11 +21,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
 	"github.com/distribution/reference"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,13 +37,26 @@ import (
 	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
-const revisionAnnotation = "churnless.io/image-revision"
+const (
+	revisionAnnotation              = "churnless.io/in-place-revision"
+	managedLabelKeysAnnotation      = "churnless.io/managed-template-label-keys"
+	managedAnnotationKeysAnnotation = "churnless.io/managed-template-annotation-keys"
+	inPlaceResourcesAnnotation      = "churnless.io/in-place-resources"
+	inPlaceResourcesBestEffort      = "best-effort"
+	redeployAnnotation              = "churnless.io/redeploy-at"
+	kubectlRestartedAtAnnotation    = "kubectl.kubernetes.io/restartedAt"
+	podResizeSubresource            = "resize"
+)
 
 type podProgress struct {
 	Revision string
 	Updated  int32
 	Ready    int32
 	Total    int32
+}
+
+type mutablePodPolicy struct {
+	resizeResources bool
 }
 
 func desiredReplicas(replicas *int32) int32 {
@@ -59,20 +74,74 @@ func selectorString(selector *metav1.LabelSelector) (string, error) {
 	return parsed.String(), nil
 }
 
-func imageRevision(template *corev1.PodTemplateSpec) string {
-	type image struct {
-		Name  string `json:"name"`
-		Image string `json:"image"`
-		Init  bool   `json:"init,omitempty"`
+func mutablePodPolicyFor(annotations map[string]string) mutablePodPolicy {
+	return mutablePodPolicy{
+		resizeResources: annotations[inPlaceResourcesAnnotation] == inPlaceResourcesBestEffort,
 	}
-	images := make([]image, 0, len(template.Spec.InitContainers)+len(template.Spec.Containers))
-	for _, container := range template.Spec.InitContainers {
-		images = append(images, image{Name: container.Name, Image: container.Image, Init: true})
+}
+
+func (p mutablePodPolicy) resourcePolicy() string {
+	if p.resizeResources {
+		return inPlaceResourcesBestEffort
 	}
-	for _, container := range template.Spec.Containers {
-		images = append(images, image{Name: container.Name, Image: container.Image})
+	return ""
+}
+
+func (p mutablePodPolicy) applyResourcePolicy(annotations map[string]string) {
+	if p.resizeResources {
+		annotations[inPlaceResourcesAnnotation] = inPlaceResourcesBestEffort
+	} else {
+		delete(annotations, inPlaceResourcesAnnotation)
 	}
-	data, _ := json.Marshal(images)
+}
+
+func (p mutablePodPolicy) clearFromStructural(template *corev1.PodTemplateSpec) {
+	template.Labels = nil
+	template.Annotations = nil
+	clearImages(template)
+	if p.resizeResources {
+		clearResizableResources(template)
+	}
+}
+
+func (p mutablePodPolicy) revision(template *corev1.PodTemplateSpec) string {
+	type revisionContainer struct {
+		Name      string                       `json:"name"`
+		Image     string                       `json:"image"`
+		Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+		Init      bool                         `json:"init,omitempty"`
+	}
+	containers := make(
+		[]revisionContainer,
+		0,
+		len(template.Spec.InitContainers)+len(template.Spec.Containers),
+	)
+	for _, current := range template.Spec.InitContainers {
+		containers = append(containers, revisionContainer{
+			Name: current.Name, Image: current.Image, Init: true,
+		})
+	}
+	for _, current := range template.Spec.Containers {
+		item := revisionContainer{
+			Name:  current.Name,
+			Image: current.Image,
+		}
+		if p.resizeResources {
+			resources := resizableResources(current.Resources)
+			item.Resources = &resources
+		}
+		containers = append(containers, item)
+	}
+	clean := cleanTemplate(template)
+	data, _ := json.Marshal(struct {
+		Labels      map[string]string   `json:"labels,omitempty"`
+		Annotations map[string]string   `json:"annotations,omitempty"`
+		Containers  []revisionContainer `json:"containers"`
+	}{
+		Labels:      clean.Labels,
+		Annotations: clean.Annotations,
+		Containers:  containers,
+	})
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum[:8])
 }
@@ -84,6 +153,8 @@ func cleanTemplate(template *corev1.PodTemplateSpec) *corev1.PodTemplateSpec {
 		clean.Labels = nil
 	}
 	delete(clean.Annotations, revisionAnnotation)
+	delete(clean.Annotations, managedLabelKeysAnnotation)
+	delete(clean.Annotations, managedAnnotationKeysAnnotation)
 	if len(clean.Annotations) == 0 {
 		clean.Annotations = nil
 	}
@@ -99,22 +170,39 @@ func clearImages(template *corev1.PodTemplateSpec) {
 	}
 }
 
+func clearResizableResources(template *corev1.PodTemplateSpec) {
+	for i := range template.Spec.Containers {
+		resources := &template.Spec.Containers[i].Resources
+		delete(resources.Requests, corev1.ResourceCPU)
+		delete(resources.Requests, corev1.ResourceMemory)
+		delete(resources.Limits, corev1.ResourceCPU)
+		delete(resources.Limits, corev1.ResourceMemory)
+		if len(resources.Requests) == 0 {
+			resources.Requests = nil
+		}
+		if len(resources.Limits) == 0 {
+			resources.Limits = nil
+		}
+	}
+}
+
 func calculateProgress(
 	pods []corev1.Pod,
 	template *corev1.PodTemplateSpec,
 	eligible func(corev1.Pod) bool,
+	policy mutablePodPolicy,
 ) podProgress {
-	progress := podProgress{Revision: imageRevision(template)}
+	progress := podProgress{Revision: policy.revision(template)}
 	for i := range pods {
 		if !eligible(pods[i]) {
 			continue
 		}
 		progress.Total++
-		if !podSpecHasImages(&pods[i], template) {
+		if !policy.specMatches(&pods[i], template) {
 			continue
 		}
 		progress.Updated++
-		if podReadyAndObserved(&pods[i], template) {
+		if policy.readyAndObserved(&pods[i], template) {
 			progress.Ready++
 		}
 	}
@@ -128,7 +216,7 @@ func updatePods(
 	template *corev1.PodTemplateSpec,
 	eligible func(corev1.Pod) bool,
 	parallelism int,
-	less func(corev1.Pod, corev1.Pod) bool,
+	policy mutablePodPolicy,
 ) error {
 	if parallelism < 1 {
 		return nil
@@ -136,22 +224,18 @@ func updatePods(
 	inFlight := 0
 	for i := range pods {
 		if eligible(pods[i]) &&
-			podSpecHasImages(&pods[i], template) &&
-			!podReadyAndObserved(&pods[i], template) {
+			!policy.resizeInfeasible(&pods[i]) &&
+			policy.specMatches(&pods[i], template) &&
+			!policy.readyAndObserved(&pods[i], template) {
 			inFlight++
 		}
 	}
 
-	if less == nil {
-		less = func(left, right corev1.Pod) bool {
-			return left.CreationTimestamp.Before(&right.CreationTimestamp)
-		}
-	}
 	slices.SortStableFunc(pods, func(left, right corev1.Pod) int {
 		switch {
-		case less(left, right):
+		case left.CreationTimestamp.Before(&right.CreationTimestamp):
 			return -1
-		case less(right, left):
+		case right.CreationTimestamp.Before(&left.CreationTimestamp):
 			return 1
 		default:
 			return 0
@@ -161,23 +245,65 @@ func updatePods(
 		if inFlight >= parallelism {
 			break
 		}
-		if !eligible(pods[i]) || podSpecHasImages(&pods[i], template) {
+		if !eligible(pods[i]) {
 			continue
 		}
+		if policy.resizeInfeasible(&pods[i]) {
+			if err := c.Delete(ctx, &pods[i]); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf(
+					"replace Pod %s/%s after infeasible resize: %w",
+					pods[i].Namespace,
+					pods[i].Name,
+					err,
+				)
+			}
+			inFlight++
+			continue
+		}
+		if policy.specMatches(&pods[i], template) {
+			continue
+		}
+
 		before := pods[i].DeepCopy()
 		if err := setPodImages(&pods[i], template); err != nil {
 			return err
 		}
-		if pods[i].Annotations == nil {
-			pods[i].Annotations = map[string]string{}
-		}
-		pods[i].Annotations[revisionAnnotation] = imageRevision(template)
+		setPodMetadata(&pods[i], template)
+		pods[i].Annotations[revisionAnnotation] = policy.revision(template)
 		if err := c.Patch(ctx, &pods[i], client.MergeFrom(before)); err != nil {
 			return fmt.Errorf("patch Pod %s/%s: %w", pods[i].Namespace, pods[i].Name, err)
+		}
+
+		if policy.resizeResources && !podHasResizableResources(&pods[i], template) {
+			if err := setPodResizableResources(&pods[i], template); err != nil {
+				return err
+			}
+			if err := c.SubResource(podResizeSubresource).Update(ctx, &pods[i]); err != nil {
+				if !fallbackFromResizeError(err) {
+					return fmt.Errorf(
+						"resize Pod %s/%s: %w",
+						pods[i].Namespace,
+						pods[i].Name,
+						err,
+					)
+				}
+				if deleteErr := c.Delete(ctx, &pods[i]); client.IgnoreNotFound(deleteErr) != nil {
+					return fmt.Errorf(
+						"replace Pod %s/%s after resize rejection: %w",
+						pods[i].Namespace,
+						pods[i].Name,
+						deleteErr,
+					)
+				}
+			}
 		}
 		inFlight++
 	}
 	return nil
+}
+
+func (p mutablePodPolicy) resizeInfeasible(pod *corev1.Pod) bool {
+	return p.resizeResources && pod.Status.Resize == corev1.PodResizeStatusInfeasible
 }
 
 func setPodImages(pod *corev1.Pod, template *corev1.PodTemplateSpec) error {
@@ -205,6 +331,108 @@ func setContainerImages(current, desired []corev1.Container) error {
 	return nil
 }
 
+func setPodMetadata(pod *corev1.Pod, template *corev1.PodTemplateSpec) {
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+
+	desiredManagedLabels := managedTemplateLabelKeys(template.Labels)
+	for _, key := range decodeManagedKeys(pod.Annotations[managedLabelKeysAnnotation]) {
+		if _, ok := desiredManagedLabels[key]; !ok {
+			delete(pod.Labels, key)
+		}
+	}
+	maps.Copy(pod.Labels, template.Labels)
+
+	desiredManagedAnnotations := managedTemplateAnnotationKeys(template.Annotations)
+	for _, key := range decodeManagedKeys(pod.Annotations[managedAnnotationKeysAnnotation]) {
+		if _, ok := desiredManagedAnnotations[key]; !ok {
+			delete(pod.Annotations, key)
+		}
+	}
+	maps.Copy(pod.Annotations, template.Annotations)
+
+	pod.Annotations[managedLabelKeysAnnotation] = encodeManagedKeys(desiredManagedLabels)
+	pod.Annotations[managedAnnotationKeysAnnotation] = encodeManagedKeys(desiredManagedAnnotations)
+}
+
+func podMetadataMatches(pod *corev1.Pod, template *corev1.PodTemplateSpec) bool {
+	for key, value := range template.Labels {
+		if pod.Labels[key] != value {
+			return false
+		}
+	}
+	for key, value := range template.Annotations {
+		if pod.Annotations[key] != value {
+			return false
+		}
+	}
+
+	desiredManagedLabels := managedTemplateLabelKeys(template.Labels)
+	for _, key := range decodeManagedKeys(pod.Annotations[managedLabelKeysAnnotation]) {
+		if _, ok := desiredManagedLabels[key]; !ok {
+			return false
+		}
+	}
+	desiredManagedAnnotations := managedTemplateAnnotationKeys(template.Annotations)
+	for _, key := range decodeManagedKeys(pod.Annotations[managedAnnotationKeysAnnotation]) {
+		if _, ok := desiredManagedAnnotations[key]; !ok {
+			return false
+		}
+	}
+	return pod.Annotations[managedLabelKeysAnnotation] == encodeManagedKeys(desiredManagedLabels) &&
+		pod.Annotations[managedAnnotationKeysAnnotation] == encodeManagedKeys(desiredManagedAnnotations)
+}
+
+func managedTemplateLabelKeys(values map[string]string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for key := range values {
+		if key != structuralRevisionLabel {
+			result[key] = struct{}{}
+		}
+	}
+	return result
+}
+
+func managedTemplateAnnotationKeys(values map[string]string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for key := range values {
+		switch key {
+		case revisionAnnotation, managedLabelKeysAnnotation, managedAnnotationKeysAnnotation:
+			continue
+		default:
+			result[key] = struct{}{}
+		}
+	}
+	return result
+}
+
+func encodeManagedKeys(values map[string]struct{}) string {
+	keys := slices.Sorted(maps.Keys(values))
+	data, _ := json.Marshal(keys)
+	return string(data)
+}
+
+func decodeManagedKeys(value string) []string {
+	var keys []string
+	if err := json.Unmarshal([]byte(value), &keys); err != nil {
+		return nil
+	}
+	return keys
+}
+
+func (p mutablePodPolicy) specMatches(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+) bool {
+	return podMetadataMatches(pod, template) &&
+		podSpecHasImages(pod, template) &&
+		(!p.resizeResources || podHasResizableResources(pod, template))
+}
+
 func podSpecHasImages(pod *corev1.Pod, template *corev1.PodTemplateSpec) bool {
 	return podContainersHaveImages(pod.Spec.InitContainers, template.Spec.InitContainers) &&
 		podContainersHaveImages(pod.Spec.Containers, template.Spec.Containers)
@@ -223,7 +451,116 @@ func podContainersHaveImages(current, desired []corev1.Container) bool {
 	return true
 }
 
-func podReadyAndObserved(pod *corev1.Pod, template *corev1.PodTemplateSpec) bool {
+func resizableResources(resources corev1.ResourceRequirements) corev1.ResourceRequirements {
+	result := corev1.ResourceRequirements{}
+	for name, quantity := range resources.Requests {
+		if name == corev1.ResourceCPU || name == corev1.ResourceMemory {
+			if result.Requests == nil {
+				result.Requests = corev1.ResourceList{}
+			}
+			result.Requests[name] = quantity.DeepCopy()
+		}
+	}
+	for name, quantity := range resources.Limits {
+		if name == corev1.ResourceCPU || name == corev1.ResourceMemory {
+			if result.Limits == nil {
+				result.Limits = corev1.ResourceList{}
+			}
+			result.Limits[name] = quantity.DeepCopy()
+		}
+	}
+	return result
+}
+
+func podHasResizableResources(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+) bool {
+	currentByName := make(map[string]corev1.ResourceRequirements, len(pod.Spec.Containers))
+	for i := range pod.Spec.Containers {
+		currentByName[pod.Spec.Containers[i].Name] = resizableResources(
+			pod.Spec.Containers[i].Resources,
+		)
+	}
+	for i := range template.Spec.Containers {
+		current, ok := currentByName[template.Spec.Containers[i].Name]
+		if !ok || !apiequality.Semantic.DeepEqual(
+			current,
+			resizableResources(template.Spec.Containers[i].Resources),
+		) {
+			return false
+		}
+	}
+	return true
+}
+
+func setPodResizableResources(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+) error {
+	currentByName := make(map[string]int, len(pod.Spec.Containers))
+	for i := range pod.Spec.Containers {
+		currentByName[pod.Spec.Containers[i].Name] = i
+	}
+	for i := range template.Spec.Containers {
+		index, ok := currentByName[template.Spec.Containers[i].Name]
+		if !ok {
+			return fmt.Errorf(
+				"container %q is missing from Pod during resize",
+				template.Spec.Containers[i].Name,
+			)
+		}
+		current := &pod.Spec.Containers[index].Resources
+		delete(current.Requests, corev1.ResourceCPU)
+		delete(current.Requests, corev1.ResourceMemory)
+		delete(current.Limits, corev1.ResourceCPU)
+		delete(current.Limits, corev1.ResourceMemory)
+		desired := resizableResources(template.Spec.Containers[i].Resources)
+		if current.Requests == nil && len(desired.Requests) > 0 {
+			current.Requests = corev1.ResourceList{}
+		}
+		if current.Limits == nil && len(desired.Limits) > 0 {
+			current.Limits = corev1.ResourceList{}
+		}
+		for name, quantity := range desired.Requests {
+			current.Requests[name] = quantity.DeepCopy()
+		}
+		for name, quantity := range desired.Limits {
+			current.Limits[name] = quantity.DeepCopy()
+		}
+		if len(current.Requests) == 0 {
+			current.Requests = nil
+		}
+		if len(current.Limits) == 0 {
+			current.Limits = nil
+		}
+	}
+	return nil
+}
+
+func fallbackFromResizeError(err error) bool {
+	switch apierrors.ReasonForError(err) {
+	case metav1.StatusReasonBadRequest,
+		metav1.StatusReasonForbidden,
+		metav1.StatusReasonInvalid,
+		metav1.StatusReasonMethodNotAllowed,
+		metav1.StatusReasonNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p mutablePodPolicy) readyAndObserved(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+) bool {
+	if !p.specMatches(pod, template) {
+		return false
+	}
+	if p.resizeResources && pod.Status.Resize != "" {
+		return false
+	}
 	if !kubecompat.IsPodReady(pod) {
 		return false
 	}

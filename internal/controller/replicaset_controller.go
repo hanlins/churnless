@@ -22,6 +22,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -40,13 +41,17 @@ import (
 	"github.com/hanlins/churnless/internal/kubecompat"
 )
 
-const inPlaceParallelismAnnotation = "churnless.io/in-place-parallelism"
+const (
+	inPlaceParallelismAnnotation = "churnless.io/in-place-parallelism"
+	podControllerUIDIndex        = ".metadata.controllerUID"
+)
 
 // ReplicaSetReconciler reconciles a ReplicaSet.
 type ReplicaSetReconciler struct {
 	client.Client
-	APIReader client.Reader
-	Scheme    *runtime.Scheme
+	APIReader       client.Reader
+	Scheme          *runtime.Scheme
+	podOwnerIndexed bool
 }
 
 // +kubebuilder:rbac:groups=churnless.io,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
@@ -54,6 +59,7 @@ type ReplicaSetReconciler struct {
 // +kubebuilder:rbac:groups=churnless.io,resources=replicasets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods/resize,verbs=update
 
 // Reconcile makes the custom ReplicaSet the sole controller of its Pods.
 func (r *ReplicaSetReconciler) Reconcile(
@@ -87,6 +93,7 @@ func (r *ReplicaSetReconciler) Reconcile(
 	}
 
 	active, terminating := activeReplicaSetPods(pods)
+	policy := mutablePodPolicyFor(workload.Annotations)
 	if changed, err := r.reconcileReplicas(ctx, &workload, active); err != nil || changed {
 		return ctrl.Result{Requeue: changed}, err
 	}
@@ -97,12 +104,17 @@ func (r *ReplicaSetReconciler) Reconcile(
 		&workload.Spec.Template,
 		allPods,
 		replicaSetParallelism(&workload),
-		nil,
+		policy,
 	); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	progress := calculateProgress(active, &workload.Spec.Template, allPods)
+	progress := calculateProgress(
+		active,
+		&workload.Spec.Template,
+		allPods,
+		policy,
+	)
 	selectorText, err := selectorString(workload.Spec.Selector)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("format selector: %w", err)
@@ -149,14 +161,14 @@ func (r *ReplicaSetReconciler) claimPods(
 	workload *appsv1alpha1.ReplicaSet,
 	selector labels.Selector,
 ) ([]corev1.Pod, bool, error) {
-	var list corev1.PodList
-	if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+	pods, err := r.podCandidates(ctx, workload, selector)
+	if err != nil {
 		return nil, false, err
 	}
 
-	claimed := make([]corev1.Pod, 0, len(list.Items))
-	for i := range list.Items {
-		pod := &list.Items[i]
+	claimed := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		pod := &pods[i]
 		controlled := metav1.IsControlledBy(pod, workload)
 		matches := selector.Matches(labels.Set(pod.Labels))
 		switch {
@@ -199,6 +211,94 @@ func (r *ReplicaSetReconciler) claimPods(
 		}
 	}
 	return claimed, false, nil
+}
+
+func (r *ReplicaSetReconciler) podCandidates(
+	ctx context.Context,
+	workload *appsv1alpha1.ReplicaSet,
+	selector labels.Selector,
+) ([]corev1.Pod, error) {
+	if !r.podOwnerIndexed {
+		var list corev1.PodList
+		if err := r.reader().List(
+			ctx,
+			&list,
+			client.InNamespace(workload.Namespace),
+		); err != nil {
+			return nil, err
+		}
+		return list.Items, nil
+	}
+
+	var matching corev1.PodList
+	if err := r.APIReader.List(
+		ctx,
+		&matching,
+		client.InNamespace(workload.Namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	); err != nil {
+		return nil, err
+	}
+	candidates := make(map[string]corev1.Pod, len(matching.Items))
+	for i := range matching.Items {
+		candidates[podKey(&matching.Items[i])] = matching.Items[i]
+	}
+
+	controlled, err := r.cachedControlledPods(ctx, workload.Namespace, workload.UID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range controlled {
+		key := podKey(&controlled[i])
+		if _, ok := candidates[key]; ok {
+			continue
+		}
+		var fresh corev1.Pod
+		if err := r.APIReader.Get(
+			ctx,
+			client.ObjectKeyFromObject(&controlled[i]),
+			&fresh,
+		); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		candidates[key] = fresh
+	}
+
+	result := make([]corev1.Pod, 0, len(candidates))
+	for _, pod := range candidates {
+		result = append(result, pod)
+	}
+	slices.SortFunc(result, func(left, right corev1.Pod) int {
+		return strings.Compare(podKey(&left), podKey(&right))
+	})
+	return result, nil
+}
+
+func (r *ReplicaSetReconciler) cachedControlledPods(
+	ctx context.Context,
+	namespace string,
+	uid types.UID,
+) ([]corev1.Pod, error) {
+	var list corev1.PodList
+	if err := r.List(
+		ctx,
+		&list,
+		client.InNamespace(namespace),
+		client.MatchingFields{podControllerUIDIndex: string(uid)},
+	); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func podControllerUID(object client.Object) []string {
+	owner := metav1.GetControllerOf(object)
+	if owner == nil {
+		return nil
+	}
+	return []string{string(owner.UID)}
 }
 
 func (r *ReplicaSetReconciler) canAdopt(
@@ -312,13 +412,26 @@ func (r *ReplicaSetReconciler) relatedPods(
 		}
 	}
 
-	var list corev1.PodList
-	if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
-		return nil, err
+	var candidates []corev1.Pod
+	if !r.podOwnerIndexed {
+		var list corev1.PodList
+		if err := r.reader().List(ctx, &list, client.InNamespace(workload.Namespace)); err != nil {
+			return nil, err
+		}
+		candidates = list.Items
+	} else {
+		for uid := range relatedReplicaSets {
+			pods, err := r.cachedControlledPods(ctx, workload.Namespace, uid)
+			if err != nil {
+				return nil, err
+			}
+			candidates = append(candidates, pods...)
+		}
 	}
-	related := make([]corev1.Pod, 0, len(list.Items))
-	for i := range list.Items {
-		pod := &list.Items[i]
+
+	related := make([]corev1.Pod, 0, len(candidates))
+	for i := range candidates {
+		pod := &candidates[i]
 		owner := metav1.GetControllerOf(pod)
 		if owner == nil {
 			continue
@@ -357,21 +470,18 @@ func (r *ReplicaSetReconciler) createPod(
 	workload *appsv1alpha1.ReplicaSet,
 ) error {
 	template := workload.Spec.Template.DeepCopy()
-	annotations := maps.Clone(template.Annotations)
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations[revisionAnnotation] = imageRevision(template)
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: workload.Name + "-",
 			Namespace:    workload.Namespace,
 			Labels:       maps.Clone(template.Labels),
-			Annotations:  annotations,
+			Annotations:  maps.Clone(template.Annotations),
 			Finalizers:   slices.Clone(template.Finalizers),
 		},
 		Spec: *template.Spec.DeepCopy(),
 	}
+	setPodMetadata(&pod, template)
+	pod.Annotations[revisionAnnotation] = mutablePodPolicyFor(workload.Annotations).revision(template)
 	if err := controllerutil.SetControllerReference(workload, &pod, r.Scheme); err != nil {
 		return err
 	}
@@ -458,6 +568,15 @@ func availableReplicas(pods []corev1.Pod, minReadySeconds int32) int32 {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ReplicaSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&corev1.Pod{},
+		podControllerUIDIndex,
+		podControllerUID,
+	); err != nil {
+		return fmt.Errorf("index Pods by controller UID: %w", err)
+	}
+	r.podOwnerIndexed = true
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
 	}

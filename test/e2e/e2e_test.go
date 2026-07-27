@@ -31,7 +31,10 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
+	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 	"github.com/hanlins/churnless/test/utils"
 )
 
@@ -46,6 +49,8 @@ const metricsServiceName = "churnless-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "churnless-metrics-binding"
+
+const kubectlRestartAnnotationKey = "kubectl.kubernetes.io/restartedAt"
 
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
@@ -564,6 +569,143 @@ spec:
 			eventuallyDeploymentPods(workload, 1, newImage)
 		})
 
+		It("should enforce RollingUpdate availability and surge limits", func() {
+			const (
+				workload = "rolling-policy"
+				oldImage = "nginx:1.27-alpine"
+				newImage = "nginx:1.28-alpine"
+				replicas = 4
+			)
+			defer deleteChurnlessDeployment(workload)
+
+			By("creating a workload with absolute RollingUpdate fenceposts")
+			Expect(applyPolicyDeployment(
+				workload,
+				replicas,
+				appsv1.RollingUpdateDeploymentStrategyType,
+				oldImage,
+			)).To(Succeed())
+			before := eventuallyDeploymentPods(workload, replicas, oldImage)
+			eventuallyChurnlessDeploymentComplete(workload, replicas)
+
+			By("starting a structural rollout")
+			Expect(patchStructuralRevision(workload, newImage)).To(Succeed())
+
+			// This mirrors the availability and surge invariants exercised by
+			// Kubernetes v1.36's Deployment RollingUpdate controller tests.
+			after := watchRollingUpdatePolicy(
+				workload,
+				newImage,
+				replicas,
+				replicas+1,
+				replicas-1,
+			)
+			Expect(retainedIdentities(before, after)).To(BeZero(),
+				"a structural rollout unexpectedly retained Pod identity")
+		})
+
+		It("should not overlap old and new Pods during a Recreate rollout", func() {
+			const (
+				workload = "recreate-policy"
+				oldImage = "nginx:1.27-alpine"
+				newImage = "nginx:1.28-alpine"
+				replicas = 2
+			)
+			defer deleteChurnlessDeployment(workload)
+
+			By("creating a Recreate workload with a visible termination window")
+			Expect(applyPolicyDeployment(
+				workload,
+				replicas,
+				appsv1.RecreateDeploymentStrategyType,
+				oldImage,
+			)).To(Succeed())
+			eventuallyDeploymentPods(workload, replicas, oldImage)
+			eventuallyChurnlessDeploymentComplete(workload, replicas)
+
+			By("starting a structural Recreate rollout")
+			Expect(patchStructuralRevision(workload, newImage)).To(Succeed())
+
+			// Kubernetes's Recreate conformance test watches this exact
+			// invariant: no new Pod may run while an old Pod is still active.
+			watchRecreatePolicy(workload, oldImage, newImage, replicas)
+		})
+
+		It("should update mutable fields in place and rebuild on fallback, restart, and immutable changes", func() {
+			const (
+				workload = "mutable-fields"
+				image    = "nginx:1.28-alpine"
+			)
+			defer deleteChurnlessDeployment(workload)
+
+			By("creating an opt-in best-effort resource workload")
+			Expect(applyMutableFieldsDeployment(workload, image)).To(Succeed())
+			expectedPod := mutablePodExpectation{
+				workload:      workload,
+				image:         image,
+				cpuRequest:    "100m",
+				memoryRequest: "32Mi",
+			}
+			initial := eventuallyMutablePod(expectedPod)
+			initialReplicaSet := eventuallyDeploymentReplicaSet(workload, image)
+
+			By("changing Pod-template labels and annotations")
+			Expect(patchMutableMetadata(workload)).To(Succeed())
+			expectedPod.labelValue = "two"
+			expectedPod.annotationValue = "two"
+			metadataUpdated := eventuallyMutablePod(expectedPod)
+			Expect(metadataUpdated.UID).To(Equal(initial.UID))
+			Expect(metadataUpdated.Status.PodIP).To(Equal(initial.Status.PodIP))
+			Expect(eventuallyDeploymentReplicaSet(workload, image).UID).
+				To(Equal(initialReplicaSet.UID))
+
+			By("resizing CPU in place while preserving the Pod QoS class")
+			Expect(patchMutableResources(
+				workload,
+				image,
+				"200m",
+				"",
+				"32Mi",
+				"",
+			)).To(Succeed())
+			expectedPod.cpuRequest = "200m"
+			resized := eventuallyMutablePod(expectedPod)
+			Expect(resized.UID).To(Equal(initial.UID))
+			Expect(resized.Status.PodIP).To(Equal(initial.Status.PodIP))
+
+			By("falling back to replacement when resize would change Pod QoS")
+			Expect(patchMutableResources(
+				workload,
+				image,
+				"200m",
+				"200m",
+				"64Mi",
+				"64Mi",
+			)).To(Succeed())
+			expectedPod.cpuLimit = "200m"
+			expectedPod.memoryRequest = "64Mi"
+			expectedPod.memoryLimit = "64Mi"
+			fallback := eventuallyMutablePod(expectedPod)
+			Expect(fallback.UID).NotTo(Equal(resized.UID))
+			Expect(eventuallyDeploymentReplicaSet(workload, image).UID).
+				To(Equal(initialReplicaSet.UID),
+					"best-effort fallback unexpectedly created another ReplicaSet")
+
+			By("triggering redeploy with the standard kubectl restart annotation")
+			Expect(kubectlRestartAnnotation(workload)).To(Succeed())
+			eventuallyOwnedReplicaSetCount(workload, 2)
+			expectedPod.excludedUID = fallback.UID
+			restarted := eventuallyMutablePod(expectedPod)
+			Expect(restarted.UID).NotTo(Equal(fallback.UID))
+
+			By("changing an immutable container field")
+			Expect(patchImmutableField(workload, image)).To(Succeed())
+			eventuallyOwnedReplicaSetCount(workload, 3)
+			expectedPod.excludedUID = restarted.UID
+			immutable := eventuallyMutablePod(expectedPod)
+			Expect(immutable.UID).NotTo(Equal(restarted.UID))
+		})
+
 		It("should match native admission defaults and critical validation", func() {
 			native, err := serverDryRunDeployment("apps/v1", "admission-defaults", true)
 			Expect(err).NotTo(HaveOccurred())
@@ -697,6 +839,15 @@ type podIdentity struct {
 	IP  string
 }
 
+type policyPodSnapshot struct {
+	Active         int
+	Ready          int
+	ByImage        map[string]int
+	PresentByImage map[string]int
+	RunningByImage map[string]int
+	Identities     map[string]podIdentity
+}
+
 type replicaSetIdentity struct {
 	Name string
 	UID  string
@@ -820,6 +971,430 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 		result = current
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	return result
+}
+
+func eventuallyChurnlessDeploymentComplete(workload string, replicas int32) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"deployment.churnless.io",
+			workload,
+			"-o",
+			"json",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var deployment appsv1alpha1.Deployment
+		g.Expect(json.Unmarshal([]byte(output), &deployment)).To(Succeed())
+		g.Expect(deployment.Status.ObservedGeneration).To(
+			BeNumerically(">=", deployment.Generation),
+		)
+		g.Expect(deployment.Status.Replicas).To(Equal(replicas))
+		g.Expect(deployment.Status.UpdatedReplicas).To(Equal(replicas))
+		g.Expect(deployment.Status.AvailableReplicas).To(Equal(replicas))
+		g.Expect(deployment.Status.InPlace).NotTo(BeNil())
+		g.Expect(deployment.Status.InPlace.ReadyUpdatedReplicas).To(Equal(replicas))
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func applyPolicyDeployment(
+	workload string,
+	replicas int,
+	strategy appsv1.DeploymentStrategyType,
+	image string,
+) error {
+	strategyYAML := fmt.Sprintf("  strategy:\n    type: %s\n", strategy)
+	if strategy == appsv1.RollingUpdateDeploymentStrategyType {
+		strategyYAML += "    rollingUpdate:\n      maxSurge: 1\n      maxUnavailable: 1\n"
+	}
+	manifest := fmt.Sprintf(`apiVersion: churnless.io/v1alpha1
+kind: Deployment
+metadata:
+  name: %s
+spec:
+  replicas: %d
+%s  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: nginx
+        image: %s
+`, workload, replicas, strategyYAML, workload, workload, image)
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func patchStructuralRevision(workload, image string) error {
+	patch := fmt.Sprintf(
+		`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","env":[{"name":"CHURNLESS_E2E_IMMUTABLE","value":"two"}]}]}}}}`,
+		image,
+	)
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.churnless.io",
+		workload,
+		"--type=merge",
+		"-p",
+		patch,
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func applyMutableFieldsDeployment(workload, image string) error {
+	manifest := fmt.Sprintf(`apiVersion: churnless.io/v1alpha1
+kind: Deployment
+metadata:
+  name: %s
+  annotations:
+    churnless.io/in-place-resources: best-effort
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: nginx
+        image: %s
+        resources:
+          requests:
+            cpu: 100m
+            memory: 32Mi
+`, workload, workload, workload, image)
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func patchMutableMetadata(workload string) error {
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.churnless.io",
+		workload,
+		"--type=merge",
+		"-p",
+		`{"spec":{"template":{"metadata":{"labels":{"example.com/track":"two"},"annotations":{"example.com/revision":"two"}}}}}`,
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func patchMutableResources(
+	workload, image, cpuRequest, cpuLimit, memoryRequest, memoryLimit string,
+) error {
+	requests := fmt.Sprintf(`"cpu":"%s","memory":"%s"`, cpuRequest, memoryRequest)
+	limits := ""
+	if cpuLimit != "" || memoryLimit != "" {
+		limits = fmt.Sprintf(
+			`,"limits":{"cpu":"%s","memory":"%s"}`,
+			cpuLimit,
+			memoryLimit,
+		)
+	}
+	patch := fmt.Sprintf(
+		`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","resources":{"requests":{%s}%s}}]}}}}`,
+		image,
+		requests,
+		limits,
+	)
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.churnless.io",
+		workload,
+		"--type=merge",
+		"-p",
+		patch,
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func kubectlRestartAnnotation(workload string) error {
+	cmd := exec.Command(
+		"kubectl",
+		"annotate",
+		"deployment.churnless.io/"+workload,
+		kubectlRestartAnnotationKey+"="+time.Now().UTC().Format(time.RFC3339Nano),
+		"--overwrite",
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func patchImmutableField(workload, image string) error {
+	patch := fmt.Sprintf(
+		`{"spec":{"template":{"spec":{"containers":[{"name":"nginx","image":"%s","resources":{"requests":{"cpu":"200m","memory":"64Mi"},"limits":{"cpu":"200m","memory":"64Mi"}},"env":[{"name":"CHURNLESS_E2E_IMMUTABLE","value":"two"}]}]}}}}`,
+		image,
+	)
+	cmd := exec.Command(
+		"kubectl",
+		"patch",
+		"deployment.churnless.io",
+		workload,
+		"--type=merge",
+		"-p",
+		patch,
+	)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+type mutablePodExpectation struct {
+	workload        string
+	image           string
+	labelValue      string
+	annotationValue string
+	cpuRequest      string
+	cpuLimit        string
+	memoryRequest   string
+	memoryLimit     string
+	excludedUID     types.UID
+}
+
+func eventuallyMutablePod(expected mutablePodExpectation) corev1.Pod {
+	var result corev1.Pod
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"pods",
+			"-l",
+			"app="+expected.workload,
+			"-o",
+			"json",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var list corev1.PodList
+		g.Expect(json.Unmarshal([]byte(output), &list)).To(Succeed())
+		current := make([]corev1.Pod, 0, 1)
+		for i := range list.Items {
+			if list.Items[i].DeletionTimestamp.IsZero() {
+				current = append(current, list.Items[i])
+			}
+		}
+		g.Expect(current).To(HaveLen(1))
+		pod := &current[0]
+		if expected.excludedUID != "" {
+			g.Expect(pod.UID).NotTo(Equal(expected.excludedUID))
+		}
+		g.Expect(pod.Spec.Containers).NotTo(BeEmpty())
+		g.Expect(pod.Spec.Containers[0].Image).To(Equal(expected.image))
+		g.Expect(pod.Status.PodIP).NotTo(BeEmpty())
+		g.Expect(podReady(pod)).To(BeTrue())
+		g.Expect(pod.Status.Resize).To(BeEmpty())
+		if expected.labelValue != "" {
+			g.Expect(pod.Labels["example.com/track"]).To(Equal(expected.labelValue))
+		}
+		if expected.annotationValue != "" {
+			g.Expect(pod.Annotations["example.com/revision"]).To(Equal(expected.annotationValue))
+		}
+		expectPodResource(g, pod, corev1.ResourceCPU, expected.cpuRequest, expected.cpuLimit)
+		expectPodResource(
+			g,
+			pod,
+			corev1.ResourceMemory,
+			expected.memoryRequest,
+			expected.memoryLimit,
+		)
+		result = *pod.DeepCopy()
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+	return result
+}
+
+func expectPodResource(
+	g Gomega,
+	pod *corev1.Pod,
+	name corev1.ResourceName,
+	request,
+	limit string,
+) {
+	resources := pod.Spec.Containers[0].Resources
+	requestQuantity, hasRequest := resources.Requests[name]
+	g.Expect(hasRequest).To(Equal(request != ""))
+	if request != "" {
+		g.Expect(requestQuantity.String()).To(Equal(request))
+	}
+	limitQuantity, hasLimit := resources.Limits[name]
+	g.Expect(hasLimit).To(Equal(limit != ""))
+	if limit != "" {
+		g.Expect(limitQuantity.String()).To(Equal(limit))
+	}
+}
+
+func eventuallyOwnedReplicaSetCount(workload string, count int) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get", "replicasets.churnless.io", "-o", "json")
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		var list appsv1alpha1.ReplicaSetList
+		g.Expect(json.Unmarshal([]byte(output), &list)).To(Succeed())
+		matches := 0
+		for i := range list.Items {
+			for _, owner := range list.Items[i].OwnerReferences {
+				if owner.Controller != nil && *owner.Controller &&
+					owner.Kind == "Deployment" &&
+					owner.Name == workload {
+					matches++
+				}
+			}
+		}
+		g.Expect(matches).To(Equal(count))
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func watchRollingUpdatePolicy(
+	workload, desiredImage string,
+	replicas, maxActive, minReady int,
+) map[string]podIdentity {
+	deadline := time.Now().Add(5 * time.Minute)
+	var last policyPodSnapshot
+	for time.Now().Before(deadline) {
+		snapshot, err := currentPolicyPods(workload)
+		Expect(err).NotTo(HaveOccurred())
+		last = snapshot
+		Expect(snapshot.Active).To(BeNumerically("<=", maxActive),
+			"RollingUpdate exceeded maxSurge")
+		Expect(snapshot.Ready).To(BeNumerically(">=", minReady),
+			"RollingUpdate exceeded maxUnavailable")
+		if snapshot.Active == replicas &&
+			snapshot.Ready == replicas &&
+			snapshot.ByImage[desiredImage] == replicas {
+			return snapshot.Identities
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	Fail(fmt.Sprintf(
+		"RollingUpdate did not complete: active=%d ready=%d images=%v",
+		last.Active,
+		last.Ready,
+		last.ByImage,
+	))
+	return nil
+}
+
+func watchRecreatePolicy(
+	workload, oldImage, desiredImage string,
+	replicas int,
+) {
+	deadline := time.Now().Add(5 * time.Minute)
+	var last policyPodSnapshot
+	for time.Now().Before(deadline) {
+		snapshot, err := currentPolicyPods(workload)
+		Expect(err).NotTo(HaveOccurred())
+		last = snapshot
+		Expect(
+			snapshot.RunningByImage[oldImage] > 0 &&
+				snapshot.RunningByImage[desiredImage] > 0,
+		).To(BeFalse(), "Recreate ran old and new Pods at the same time")
+		if snapshot.Active == replicas &&
+			snapshot.Ready == replicas &&
+			snapshot.ByImage[desiredImage] == replicas &&
+			snapshot.RunningByImage[oldImage] == 0 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	Fail(fmt.Sprintf(
+		"Recreate rollout did not complete: active=%d ready=%d images=%v",
+		last.Active,
+		last.Ready,
+		last.RunningByImage,
+	))
+}
+
+func currentPolicyPods(workload string) (policyPodSnapshot, error) {
+	cmd := exec.Command("kubectl", "get", "pods", "-l", "app="+workload, "-o", "json")
+	output, err := utils.Run(cmd)
+	if err != nil {
+		return policyPodSnapshot{}, err
+	}
+	var list corev1.PodList
+	if err := json.Unmarshal([]byte(output), &list); err != nil {
+		return policyPodSnapshot{}, err
+	}
+	snapshot := policyPodSnapshot{
+		ByImage:        make(map[string]int),
+		PresentByImage: make(map[string]int),
+		RunningByImage: make(map[string]int),
+		Identities:     make(map[string]podIdentity),
+	}
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if len(pod.Spec.Containers) == 0 {
+			return policyPodSnapshot{}, fmt.Errorf("Pod %s has no containers", pod.Name)
+		}
+		snapshot.PresentByImage[pod.Spec.Containers[0].Image]++
+		if pod.Status.Phase != corev1.PodFailed &&
+			pod.Status.Phase != corev1.PodSucceeded {
+			snapshot.RunningByImage[pod.Spec.Containers[0].Image]++
+		}
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		snapshot.Active++
+		snapshot.ByImage[pod.Spec.Containers[0].Image]++
+		if podReady(pod) {
+			snapshot.Ready++
+		}
+		snapshot.Identities[pod.Name] = podIdentity{
+			UID: string(pod.UID),
+			IP:  pod.Status.PodIP,
+		}
+	}
+	return snapshot, nil
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for i := range pod.Status.Conditions {
+		if pod.Status.Conditions[i].Type == corev1.PodReady &&
+			pod.Status.Conditions[i].Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func retainedIdentities(
+	before, after map[string]podIdentity,
+) int {
+	retained := 0
+	for name, previous := range before {
+		if current, ok := after[name]; ok && current.UID == previous.UID {
+			retained++
+		}
+	}
+	return retained
+}
+
+func deleteChurnlessDeployment(workload string) {
+	cmd := exec.Command(
+		"kubectl",
+		"delete",
+		"deployment.churnless.io",
+		workload,
+		"--ignore-not-found",
+	)
+	_, _ = utils.Run(cmd)
 }
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

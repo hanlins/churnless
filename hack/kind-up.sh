@@ -38,7 +38,11 @@ done < <("${kind_bin}" get clusters)
 
 if [[ "${cluster_exists}" == "false" ]]; then
   echo "Creating Kind cluster ${cluster}..."
-  "${kind_bin}" create cluster --name "${cluster}"
+  kind_create_args=(create cluster --name "${cluster}")
+  if [[ -n "${KIND_CONFIG:-}" ]]; then
+    kind_create_args+=(--config "${KIND_CONFIG}")
+  fi
+  "${kind_bin}" "${kind_create_args[@]}"
 else
   echo "Reusing Kind cluster ${cluster}..."
   "${kind_bin}" export kubeconfig --name "${cluster}"
@@ -133,41 +137,59 @@ if [[ "${webhook_ready}" == "false" ]]; then
   exit 1
 fi
 
-echo "Deploying the sample custom Deployment..."
-"${kubectl_bin}" --context "${context}" apply \
-  -f config/samples/churnless_v1alpha1_deployment.yaml
-pods_exist=false
-for ((attempt = 0; attempt < wait_seconds; attempt++)); do
-  pod_count="$("${kubectl_bin}" --context "${context}" get pods \
-    -l app=deployment-sample \
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w | tr -d ' ')"
-  if [[ "${pod_count}" == "2" ]]; then
-    pods_exist=true
-    break
+if [[ "${DEPLOY_SAMPLE:-true}" == "true" ]]; then
+  echo "Deploying the sample custom Deployment..."
+  sample_applied=false
+  sample_apply_output=""
+  for ((attempt = 0; attempt < wait_seconds; attempt++)); do
+    if sample_apply_output="$("${kubectl_bin}" --context "${context}" apply \
+      -f config/samples/churnless_v1alpha1_deployment.yaml 2>&1)"; then
+      echo "${sample_apply_output}"
+      sample_applied=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${sample_applied}" == "false" ]]; then
+    echo "${sample_apply_output}" >&2
+    echo "Timed out waiting for the admission webhook to accept the sample" >&2
+    exit 1
   fi
-  sleep 1
-done
-if [[ "${pods_exist}" == "false" ]]; then
-  echo "Timed out waiting for deployment-sample Pods" >&2
-  exit 1
+  pods_exist=false
+  for ((attempt = 0; attempt < wait_seconds; attempt++)); do
+    pod_count="$("${kubectl_bin}" --context "${context}" get pods \
+      -l app=deployment-sample \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w | tr -d ' ')"
+    if [[ "${pod_count}" == "2" ]]; then
+      pods_exist=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${pods_exist}" == "false" ]]; then
+    echo "Timed out waiting for deployment-sample Pods" >&2
+    exit 1
+  fi
+  "${kubectl_bin}" --context "${context}" wait \
+    --for=condition=Ready \
+    pod \
+    -l app=deployment-sample \
+    --timeout="${timeout}"
 fi
-"${kubectl_bin}" --context "${context}" wait \
-  --for=condition=Ready \
-  pod \
-  -l app=deployment-sample \
-  --timeout="${timeout}"
 
 echo
 echo "Churnless is ready in kubectl context ${context}."
-echo
-"${kubectl_bin}" --context "${context}" get \
-  deployment.churnless.io/deployment-sample
-"${kubectl_bin}" --context "${context}" get \
-  replicasets.churnless.io \
-  -l churnless.io/structural-revision
-"${kubectl_bin}" --context "${context}" get \
-  pods \
-  -l app=deployment-sample \
-  -o wide
-echo
-echo "Run 'make kind-status' to inspect it and 'make kind-down' when finished."
+if [[ "${DEPLOY_SAMPLE:-true}" == "true" ]]; then
+  echo
+  "${kubectl_bin}" --context "${context}" get \
+    deployment.churnless.io/deployment-sample
+  "${kubectl_bin}" --context "${context}" get \
+    replicasets.churnless.io \
+    -l churnless.io/structural-revision
+  "${kubectl_bin}" --context "${context}" get \
+    pods \
+    -l app=deployment-sample \
+    -o wide
+  echo
+  echo "Run 'make kind-status' to inspect it and 'make kind-down' when finished."
+fi

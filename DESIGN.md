@@ -12,7 +12,7 @@ designs emerge.
 ## Goals
 
 Churnless extends the Kubernetes workload model with one deliberate change:
-container image updates should restart containers in existing Pods instead of
+mutable Pod-template updates should be applied to existing Pods instead of
 replacing those Pods whenever Kubernetes permits it.
 
 The project aims to provide:
@@ -24,7 +24,8 @@ The project aims to provide:
 - Native workload behavior for scaling, self-healing, rollout strategies,
   readiness, availability, status, and controller ownership.
 - Standard `/scale` subresources so `kubectl scale` and HPA work normally.
-- Stable Pod name, UID, and IP during a successful image-only rollout.
+- Stable Pod name, UID, and IP during successful metadata, image, and supported
+  resource updates.
 - Clear controller responsibility boundaries and no competing shadow
   controllers.
 
@@ -34,8 +35,9 @@ scaling, or a structural template change.
 
 ## Non-goals
 
-- Mutating arbitrary Pod fields in place. Churnless only treats regular and
-  init-container images as in-place fields.
+- Mutating arbitrary Pod fields in place. Churnless treats Pod-template labels
+  and annotations plus regular and init-container images as in-place fields.
+  Regular-container CPU and memory are opt-in, best-effort fields.
 - Preserving Pod identity when Kubernetes must create a different Pod.
 - Delegating desired-state ownership to native Deployment or ReplicaSet shadow
   objects.
@@ -57,9 +59,9 @@ object has exactly one authoritative controller:
 | Resource | Responsibility |
 | --- | --- |
 | Churnless Deployment | Chooses structural revisions, creates and scales Churnless ReplicaSets, applies rollout strategy, and aggregates status. |
-| Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, updates Pod images in place, and reports status. |
+| Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, applies supported Pod metadata, image, and resource changes in place, and reports status. |
 | Admission webhooks | Apply and validate the native workload semantics that CRD schemas do not inherit from built-in API storage. |
-| kubelet | Observes the patched Pod image fields and restarts the affected containers. |
+| kubelet | Observes patched images and resource resize requests, then restarts or resizes affected containers as required. |
 
 Desired state flows only downward through this chain. Status flows upward. A
 controller must not directly manage resources owned by the layer below its
@@ -86,7 +88,7 @@ Churnless status extension is:
 status:
   selector: app=web
   inPlace:
-    revision: <image-revision>
+    revision: <in-place-revision>
     updatedReplicas: 2
     readyUpdatedReplicas: 2
 ```
@@ -97,7 +99,7 @@ Unlike the built-in Deployment REST storage, generic CRD scale storage cannot
 derive a selector string from the structured `spec.selector`; the explicit
 status field is therefore required by the CRD's `labelSelectorPath`.
 
-`ReplicaSet.status.inPlace` is the child controller's image-specific progress
+`ReplicaSet.status.inPlace` is the child controller's mutable-field progress
 contract. The Deployment consumes it only when its `revision` matches the
 ReplicaSet template and its `observedGeneration` is current. The Deployment
 status copies that fresh progress for user-facing observability; it is not
@@ -145,40 +147,91 @@ dependency and not a shadow controller.
 
 Churnless separates a Pod template into two kinds of revision.
 
-### Image revision
+### In-place revision
 
-An image revision contains the names and images of regular and init containers.
-Changing only those images:
+An in-place revision contains:
+
+- Pod-template labels and annotations.
+- The names and images of regular and init containers.
+- Regular-container CPU and memory requests/limits when the workload opts in
+  with `churnless.io/in-place-resources: best-effort`.
+
+Changing only those fields:
 
 1. Keeps the current Churnless ReplicaSet.
-2. Copies the new images into that ReplicaSet template.
-3. Patches the image fields of its existing Pods.
-4. Waits until the kubelet reports the desired images and the Pods are ready.
-5. Reports progress through `status.inPlace`.
+2. Copies the new mutable values into that ReplicaSet template.
+3. Patches supported metadata and image fields on its existing Pods.
+4. Uses the Pod `resize` subresource for opted-in CPU and memory changes.
+5. Waits until the desired Pod spec and runtime-observed state converge.
+6. Reports progress through `status.inPlace`.
 
-Pod names do not encode the image revision. The ReplicaSet and Pod objects keep
-their names and UIDs, and their IPs remain stable while the Pods remain on the
-same nodes.
+Pod names do not encode the in-place revision. The ReplicaSet and Pod objects
+keep their names and UIDs, and their IPs remain stable while the Pods remain on
+the same nodes.
+
+Metadata synchronization tracks only keys originating in the Pod template.
+Removing a previously managed key removes it from the Pod, while labels and
+annotations injected by admission or other controllers are preserved.
+
+Resource updates are deliberately best effort. Only regular-container CPU and
+memory values are candidates, and the opt-in should normally be set when the
+workload is created. If the API server, node, QoS rules, or requested values do
+not permit an in-place resize, Churnless deletes and recreates that Pod from the
+same ReplicaSet under the existing rollout availability budget. Init-container,
+extended-resource, resize-policy, and Pod-level resource changes remain
+structural.
 
 ### Structural revision
 
 A structural revision is a hash of the Pod template after internal Churnless
-metadata and all container image values are removed. Any change to that
-remaining template creates or selects a different Churnless ReplicaSet.
+metadata and all supported in-place values are removed. Any change to an
+immutable field in the remaining template creates or selects a different
+Churnless ReplicaSet.
 
 The Deployment then uses its native-shaped strategy:
 
 - `RollingUpdate` scales new and old ReplicaSets within `maxSurge` and
   `maxUnavailable`.
-- `Recreate` scales old ReplicaSets to zero before scaling the new ReplicaSet.
+- `Recreate` scales old ReplicaSets to zero and waits for their active and
+  terminating Pods to disappear before scaling the new ReplicaSet.
 - `paused: true` stops rollout progression.
 
-This boundary is fundamental: image changes are mutable revisions inside a
-ReplicaSet; all other Pod-template changes are immutable ReplicaSet revisions.
+This boundary is fundamental: only the explicitly supported fields are mutable
+inside a ReplicaSet; all other Pod-template changes are immutable ReplicaSet
+revisions.
+
+### Explicit redeploy
+
+A redeploy deliberately salts the structural revision even when the Pod
+template is otherwise unchanged. Churnless recognizes Kubernetes' standard
+restart annotation as a workload-level redeploy token:
+
+```sh
+kubectl annotate deployment.churnless.io/web \
+  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+```
+
+Native `kubectl rollout restart` writes the same key into a built-in
+Deployment's Pod template, and Churnless recognizes that placement too.
+However, the kubectl subcommand's compiled-in scheme rejects custom Deployment
+GVKs before sending a request, so the literal
+`kubectl rollout restart deployment.churnless.io/web` command cannot operate on
+the CRD. The generic `kubectl annotate` command above does not have that client
+limitation.
+
+Existing automation can alternatively set the Churnless-specific alias:
+
+```sh
+kubectl annotate deployment.churnless.io/web \
+  churnless.io/redeploy-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+```
+
+Either annotation creates a new Churnless ReplicaSet and new Pods according to
+the configured rollout strategy.
 
 ## In-place rollout behavior
 
-The Deployment calculates image-update parallelism from availability and
+The Deployment calculates in-place-update parallelism from availability and
 `maxUnavailable`, then passes that budget to the current ReplicaSet. If
 `maxUnavailable` is effectively zero and all Pods are available, one Pod is
 still updated at a time so the rollout can progress.
@@ -187,14 +240,15 @@ The ReplicaSet:
 
 1. Counts Pods already updated and Pods still restarting.
 2. Selects no more than the allowed number of additional Pods.
-3. Patches images by container name.
-4. Annotates each Pod with `churnless.io/image-revision`.
-5. Considers a Pod complete only when its spec, kubelet-observed image status,
+3. Patches supported metadata and images, and requests opted-in resource
+   resize by container name.
+4. Annotates each Pod with `churnless.io/in-place-revision`.
+5. Considers a Pod complete only when its mutable spec, kubelet-observed state,
    and readiness all match the desired revision.
 
 ReplicaSet progress is generation-fenced. A Deployment treats progress as zero
 until the ReplicaSet has observed its current spec generation and reported the
-matching image revision. This prevents an image patch from temporarily
+matching in-place revision. This prevents a Pod patch from temporarily
 presenting stale completion status.
 
 Scaling and self-healing always create Pods from the latest ReplicaSet
@@ -208,21 +262,29 @@ Every controller change must preserve these invariants:
 - A Churnless Deployment owns only Churnless ReplicaSets.
 - A Churnless ReplicaSet is the sole controller owner of its Pods.
 - Native Deployment and ReplicaSet shadows are never created.
-- Image-only changes keep the structural ReplicaSet identity.
+- Supported in-place changes keep the structural ReplicaSet identity.
 - Structural template changes use a distinct ReplicaSet identity.
-- A replacement Pod starts with the latest desired image revision.
+- Explicit redeploy tokens always use a distinct ReplicaSet identity.
+- A replacement Pod starts with the latest desired in-place revision.
 - Reconciliation is idempotent and safe after partial progress or restart.
 - Pod adoption re-reads the ReplicaSet from the API server and verifies its UID
   and deletion state before taking ownership.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
   another batch from stale informer state.
+- ReplicaSet Pod discovery combines a live selector-scoped list with a cached
+  controller-UID index. The index finds controlled Pods that stopped matching;
+  those cached-only candidates are re-read live before release. This avoids a
+  namespace-wide live Pod list without weakening replica-count or adoption
+  safety.
 - Selectors determine Pod membership; unowned matching Pods may be adopted and
   controlled Pods that stop matching are released.
 - Status reflects observed objects and never substitutes for desired state.
 
-Internal labels and annotations under `churnless.io/` are controller
-implementation details. They must not become the only source of ownership;
-Kubernetes controller owner references remain authoritative.
+Internal labels and annotations under `churnless.io/` must not become the only
+source of ownership; Kubernetes controller owner references remain
+authoritative. The documented `in-place-resources` and `redeploy-at`
+annotations are public rollout controls; other keys in that namespace remain
+controller implementation details.
 
 ## Compatibility boundary
 
@@ -233,7 +295,9 @@ current `v1alpha1` implementation still has known gaps:
 - Webhook behavior uses the feature-gate defaults compiled into the pinned
   Kubernetes library; it cannot discover different feature-gate settings or
   unrelated admission plugins configured on the hosting API server.
-- Stock `kubectl rollout` does not discover the custom GVK.
+- Built-in `kubectl rollout` subcommands use a compiled-in typed scheme and
+  cannot operate directly on the Churnless CRD. Use the documented standard
+  restart annotation with generic `kubectl annotate`.
 - Image revisions reuse one ReplicaSet, so they are not separate ReplicaSet
   history entries.
 - Progress-deadline enforcement, revision-history cleanup, hash-collision
@@ -254,9 +318,15 @@ The acceptance suite must continue to verify:
 - `Deployment.churnless.io → ReplicaSet.churnless.io → Pod`
   controller ownership.
 - Absence of native shadow workloads.
-- Stable ReplicaSet name and UID for image-only revisions.
-- Stable Pod name, UID, and IP during a successful image-only rollout.
+- Stable ReplicaSet name and UID for supported in-place revisions.
+- Stable Pod name, UID, and IP during successful metadata and image updates.
+- Best-effort CPU/memory changes either retain Pod identity through `resize` or
+  converge by controlled replacement when resize is rejected.
 - Structural changes create a different ReplicaSet.
+- `kubectl.kubernetes.io/restartedAt` and `churnless.io/redeploy-at` create a
+  different ReplicaSet and new Pods.
+- RollingUpdate stays within its availability and surge fenceposts, and
+  Recreate never runs old and new revisions at the same time.
 - `/scale` changes replica count and newly created Pods use the latest image.
 - `/scale` exposes the selector string and a real HPA can change replicas.
 - Deployment and ReplicaSet defaults, plus critical invalid-selector behavior,

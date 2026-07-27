@@ -89,10 +89,44 @@ var _ = Describe("ReplicaSet Controller", func() {
 		Expect(pod.Spec.Containers[0].Image).To(Equal(newImage))
 		Expect(pod.UID).To(Equal(uid))
 		Expect(pod.Status.PodIP).To(Equal("10.0.0.41"))
-		Expect(pod.Annotations[revisionAnnotation]).To(Equal(imageRevision(&workload.Spec.Template)))
+		Expect(pod.Annotations[revisionAnnotation]).
+			To(Equal((mutablePodPolicy{}).revision(&workload.Spec.Template)))
 
 		var native appsv1.ReplicaSet
 		Expect(k8sClient.Get(ctx, key, &native)).To(MatchError(ContainSubstring("not found")))
+	})
+
+	It("applies Pod-template labels and annotations in place", func() {
+		replicas := int32(1)
+		workload := &appsv1alpha1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: appsv1alpha1.ReplicaSetSpec{ReplicaSetSpec: appsv1.ReplicaSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
+				Template: podTemplate(name, oldImage),
+			}},
+		}
+		Expect(k8sClient.Create(ctx, workload)).To(Succeed())
+		reconciler := &ReplicaSetReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		pod := onlyPodWithLabel(ctx, namespace, name)
+		uid := pod.UID
+
+		Expect(k8sClient.Get(ctx, key, workload)).To(Succeed())
+		workload.Spec.Template.Labels["example.com/track"] = updatedTestValue
+		workload.Spec.Template.Annotations = map[string]string{
+			templateRevisionAnnotation: updatedTestValue,
+		}
+		Expect(k8sClient.Update(ctx, workload)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+		Expect(pod.UID).To(Equal(uid))
+		Expect(pod.Labels["example.com/track"]).To(Equal(updatedTestValue))
+		Expect(pod.Annotations[templateRevisionAnnotation]).To(Equal(updatedTestValue))
 	})
 })
 

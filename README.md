@@ -63,7 +63,7 @@ sequenceDiagram
         Note over Scheduler,Network: No replacement Pod: scheduling, sandbox creation, and IPAM are skipped
         Kubelet->>Kubelet: Pull image and restart container
         Kubelet-->>Control: The same Pod becomes Ready
-        Control-->>DataPlane: Readiness may change; the endpoint address stays the same
+        Control-->>DataPlane: Readiness may change, while the endpoint address stays the same
     end
 ```
 

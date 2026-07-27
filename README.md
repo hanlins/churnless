@@ -42,38 +42,42 @@ sequenceDiagram
     participant Network as CNI and IPAM
     participant DataPlane as DNS, gateways, and proxies
 
-    rect rgb(255, 245, 245)
-        Note over Change,DataPlane: Native Deployment: replacement path
+    Note over Change,DataPlane: Native Deployment replacement path
+    rect rgb(255, 235, 235)
+        Note over Control,Network: Replacement setup span skipped by Churnless
         Change->>Control: Create a new ReplicaSet and Pod
         Control->>Scheduler: Wait for scheduling
         Scheduler->>Kubelet: Bind replacement Pod
         Kubelet->>Network: Create sandbox and allocate a Pod IP
         Network-->>Kubelet: Network ready
-        Kubelet->>Kubelet: Pull image and start container
-        Kubelet-->>Control: Replacement Pod Ready
+    end
+    Kubelet->>Kubelet: Pull image and start container
+    Kubelet-->>Control: Replacement Pod Ready
+    rect rgb(255, 235, 235)
+        Note over Control,DataPlane: Address churn and teardown span skipped by Churnless
         Control-->>DataPlane: Propagate the new endpoint address
         Control->>Kubelet: Delete the old Pod
         Kubelet->>Network: Tear down network and release the old IP
     end
 
+    Note over Change,DataPlane: Churnless in-place path
     rect rgb(240, 255, 245)
-        Note over Change,DataPlane: Churnless: in-place path
         Change->>Control: Patch the image on the existing Pod
         Control->>Kubelet: Deliver the updated Pod spec
-        Note over Scheduler,Network: No replacement Pod: scheduling, sandbox creation, and IPAM are skipped
+        Note over Scheduler,Network: Reuse the existing Pod sandbox and IP
         Kubelet->>Kubelet: Pull image and restart container
         Kubelet-->>Control: The same Pod becomes Ready
         Control-->>DataPlane: Readiness may change, while the endpoint address stays the same
     end
 ```
 
-The potential critical-path saving is the replacement-only work: scheduling,
-Pod sandbox startup, CNI/IPAM allocation, and some endpoint convergence.
-Network teardown and IP release are also avoided, although they may happen
-asynchronously after a native rollout reports success. Image pull, container
-startup, and readiness checks still apply to both paths. The benchmark below
-measures the end-to-end result rather than assigning fixed durations to these
-cluster-dependent stages.
+The red spans are replacement-only work that a successful Churnless rollout
+skips: scheduling, Pod sandbox startup, CNI/IPAM allocation, endpoint-address
+churn, network teardown, and IP release. Teardown may happen asynchronously
+after a native rollout reports success. Image pull, container startup, and
+readiness checks remain unshaded because both paths still pay those costs. The
+benchmark below measures the end-to-end result rather than assigning fixed
+durations to these cluster-dependent stages.
 
 ```text
 Deployment.churnless.io

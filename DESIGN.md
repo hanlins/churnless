@@ -388,6 +388,9 @@ Every controller change must preserve these invariants:
   ReplicaSet annotations after a controller restart.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
   another batch from stale informer state.
+- Structural rollout scale-up continues counting observed active ReplicaSet
+  replicas until a prior scale-down is reflected in status, preventing a fast
+  Deployment requeue from reusing the same `maxSurge` capacity.
 - ReplicaSet Pod discovery combines a live selector-scoped list with a cached
   controller-UID index. The index finds controlled Pods that stopped matching;
   those cached-only candidates are re-read live before release. This avoids a

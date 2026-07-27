@@ -345,10 +345,15 @@ func (r *DeploymentReconciler) rollout(
 	if err != nil {
 		return false, err
 	}
-	total := totalReplicaSpec(replicaSets)
+	desiredTotal := totalReplicaSpec(replicaSets)
+	// A ReplicaSet scale-down is visible in spec before its controller removes
+	// the excess Pods and refreshes status. Keep those observed active replicas
+	// in the surge budget so a fast Deployment requeue cannot scale the new
+	// ReplicaSet up again during that window.
+	surgeTotal := max(desiredTotal, totalObservedReplicas(replicaSets))
 	currentReplicas := desiredReplicas(current.Spec.Replicas)
-	if currentReplicas < desired && total < desired+maxSurge {
-		increase := min(desired-currentReplicas, desired+maxSurge-total)
+	if currentReplicas < desired && surgeTotal < desired+maxSurge {
+		increase := min(desired-currentReplicas, desired+maxSurge-surgeTotal)
 		return r.scaleReplicaSet(ctx, current, currentReplicas+increase)
 	}
 
@@ -362,7 +367,7 @@ func (r *DeploymentReconciler) rollout(
 		}
 		unavailableOld := max(oldReplicas-old.Status.AvailableReplicas, 0)
 		availableBudget := max(totalAvailable-minAvailable, 0)
-		excess := max(total-desired, 0)
+		excess := max(desiredTotal-desired, 0)
 		needed := max(desired-currentReplicas, 0)
 		decrease := min(oldReplicas, unavailableOld+availableBudget)
 		if excess > 0 {
@@ -432,6 +437,14 @@ func totalReplicaSpec(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
 	var total int32
 	for i := range replicaSets {
 		total += desiredReplicas(replicaSets[i].Spec.Replicas)
+	}
+	return total
+}
+
+func totalObservedReplicas(replicaSets []*appsv1alpha1.ReplicaSet) int32 {
+	var total int32
+	for i := range replicaSets {
+		total += replicaSets[i].Status.Replicas
 	}
 	return total
 }

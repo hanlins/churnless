@@ -365,6 +365,42 @@ func TestDeploymentParallelismDoesNotReuseStaleAvailability(t *testing.T) {
 	}
 }
 
+func TestRollingUpdateDoesNotReuseSurgeBeforeScaleDownIsObserved(t *testing.T) {
+	t.Parallel()
+
+	maxSurge := intstr.FromInt32(1)
+	maxUnavailable := intstr.FromInt32(0)
+	workload := rolloutDeployment(
+		4,
+		appsv1.RollingUpdateDeploymentStrategyType,
+		maxSurge,
+		maxUnavailable,
+	)
+	oldReplicaSet := rolloutReplicaSet("old", "old", 3, 4)
+	oldReplicaSet.Status.Replicas = 4
+	currentReplicaSet := rolloutReplicaSet("current", "current", 1, 1)
+	scheme := newRolloutTestScheme(t)
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(oldReplicaSet.DeepCopy(), currentReplicaSet.DeepCopy()).
+		Build()
+	reconciler := &DeploymentReconciler{Client: k8sClient, Scheme: scheme}
+
+	changed, err := reconciler.rollout(
+		context.Background(),
+		workload,
+		currentReplicaSet,
+		[]*appsv1alpha1.ReplicaSet{oldReplicaSet, currentReplicaSet},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("rollout changed while observed replicas still consumed maxSurge")
+	}
+	assertReplicaCount(t, k8sClient, currentReplicaSet, 1)
+}
+
 // Kubernetes caps one ReplicaSet sync at 500 creates/deletes and slow-starts
 // creation to avoid flooding the API server when quota or admission rejects a
 // large workload. These cases exercise that behavior through the Churnless

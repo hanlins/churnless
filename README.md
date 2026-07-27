@@ -211,8 +211,12 @@ target GVK must not already exist, and the source spec must stay unchanged
 during migration. Temporary target Pods can briefly increase Pod and resource
 counts; ready source Pod identity is retained when Kubernetes permits it.
 
-This migration currently supports Deployments only. It does not retarget HPA
-or other objects that explicitly refer to the source GVK. See
+This migration currently supports Deployments only. Before cutover, the
+controller automatically retargets HorizontalPodAutoscaler,
+VerticalPodAutoscaler, and KEDA ScaledObject references to the new Deployment
+GVK. Services, PodDisruptionBudgets, and other selector-based resources keep
+matching the same Pod labels. Custom resources with other explicit workload
+references must still be reviewed separately. See
 [DESIGN.md](DESIGN.md#takeover-and-handoff) for the ownership protocol and
 failure boundary.
 

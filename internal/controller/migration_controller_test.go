@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -48,6 +49,9 @@ var _ = Describe("Migration Controller", func() {
 	AfterEach(func() {
 		for _, name := range []string{"takeover-test", "handoff-test"} {
 			deletePodsWithLabel(ctx, namespace, name)
+			deleteIfPresent(ctx, &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			})
 			deleteIfPresent(ctx, &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			})
@@ -91,6 +95,19 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		key := types.NamespacedName{Name: name, Namespace: namespace}
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+					APIVersion: appsv1.SchemeGroupVersion.String(),
+					Kind:       deploymentKind,
+					Name:       name,
+				},
+				MinReplicas: &replicas,
+				MaxReplicas: 2,
+			},
+		}
+		Expect(k8sClient.Create(ctx, hpa)).To(Succeed())
 
 		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
@@ -119,6 +136,12 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Annotations[migrationOriginalPausedAnnotation]).To(Equal(annotationEnabledValue))
 		Expect(target.Spec.Paused).To(BeFalse())
 		Expect(target.Spec.Template).To(Equal(source.Spec.Template))
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, hpa)).To(Succeed())
+		Expect(hpa.Spec.ScaleTargetRef.APIVersion).
+			To(Equal(appsv1alpha1.GroupVersion.String()))
 	})
 
 	It("creates a native target for a complete Churnless Deployment", func() {

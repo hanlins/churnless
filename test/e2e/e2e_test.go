@@ -577,6 +577,7 @@ spec:
 			)
 			DeferCleanup(func() {
 				for _, resource := range []string{
+					"horizontalpodautoscaler.autoscaling/" + workload,
 					"deployment.apps/" + workload,
 					"deployment.churnless.io/" + workload,
 				} {
@@ -594,6 +595,10 @@ spec:
 				appsv1.SchemeGroupVersion.String(),
 			)
 
+			By("creating an HPA that targets the native Deployment")
+			Expect(applyMigrationHPA(workload, replicas)).To(Succeed())
+			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
+
 			By("requesting Churnless takeover with an annotation")
 			cmd := exec.Command(
 				"kubectl",
@@ -610,6 +615,7 @@ spec:
 				appsv1alpha1.GroupVersion.String(),
 			)
 			expectPodIdentityRetained(nativePods, takenOverPods)
+			eventuallyHPATarget(workload, appsv1alpha1.GroupVersion.String())
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment.apps/"+workload)
 				_, err := utils.Run(cmd)
@@ -632,6 +638,7 @@ spec:
 				appsv1.SchemeGroupVersion.String(),
 			)
 			expectPodIdentityRetained(takenOverPods, handedOffPods)
+			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
 				_, err := utils.Run(cmd)
@@ -1119,6 +1126,47 @@ spec:
 	cmd.Stdin = strings.NewReader(manifest)
 	_, err := utils.Run(cmd)
 	return err
+}
+
+func applyMigrationHPA(workload string, replicas int) error {
+	manifest := fmt.Sprintf(`apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: %s
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: %s
+  minReplicas: %d
+  maxReplicas: %d
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+`, workload, workload, replicas, replicas)
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
+}
+
+func eventuallyHPATarget(workload, apiVersion string) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command(
+			"kubectl",
+			"get",
+			"horizontalpodautoscaler.autoscaling/"+workload,
+			"-o",
+			"jsonpath={.spec.scaleTargetRef.apiVersion}",
+		)
+		output, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(output).To(Equal(apiVersion))
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
 }
 
 func applyPolicyDeployment(

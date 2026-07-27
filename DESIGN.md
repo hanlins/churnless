@@ -279,11 +279,12 @@ silently combined.
 Before cutover, the target creates its ReplicaSet and temporary Pods. The
 controller then:
 
-1. Adds the target ReplicaSet's required labels to the live source Pods.
-2. Gives source Pods a higher deletion preference than temporary target Pods.
-3. Orphan-deletes the source Deployment and its ReplicaSets.
-4. Lets the target ReplicaSet adopt the now-unowned source Pods.
-5. Waits for the target rollout to settle, removes temporary migration
+1. Retargets supported GVK-specific dependents to the target Deployment.
+2. Adds the target ReplicaSet's required labels to the live source Pods.
+3. Gives source Pods a higher deletion preference than temporary target Pods.
+4. Orphan-deletes the source Deployment and its ReplicaSets.
+5. Lets the target ReplicaSet adopt the now-unowned source Pods.
+6. Waits for the target rollout to settle, removes temporary migration
    metadata, and restores the source's original paused state on the target.
 
 This ordering keeps the source authoritative until the target ownership chain
@@ -294,11 +295,26 @@ Pods also mean Pod objects and resource requests can briefly exceed the
 Deployment replica count, although pending or less-ready temporary Pods are
 preferred for deletion after adoption.
 
-Migration currently covers Deployments, not standalone ReplicaSets. It does
-not rewrite dependent objects. In particular, an HPA must be retargeted to the
-new `apiVersion`, and policy or automation that names a workload GVK must be
-reviewed separately. Services and selector-based PDBs continue to select Pods
-by label throughout the transfer.
+Migration currently covers Deployments, not standalone ReplicaSets. The
+controller rewrites these namespaced workload references when they point to
+the same-name source Deployment:
+
+- `autoscaling/v2` HorizontalPodAutoscaler `spec.scaleTargetRef`
+- `autoscaling.k8s.io/v1` VerticalPodAutoscaler `spec.targetRef`
+- `keda.sh/v1alpha1` ScaledObject `spec.scaleTargetRef`
+
+KEDA's omitted `apiVersion` and `kind` defaults are interpreted as
+`apps/v1 Deployment`. Each patch is idempotent and matches the source
+`apiVersion`, kind, and name before changing the `apiVersion`. KEDA is handled
+before HPA so its generated HPA follows the same target. A missing optional VPA
+or KEDA API is ignored, while an installed API that cannot be listed or patched
+blocks cutover instead of leaving a stale target.
+
+Services, selector-based PodDisruptionBudgets, and other selector-based
+resources continue to select Pods by label throughout the transfer and do not
+need a GVK rewrite. Arbitrary custom-resource reference fields cannot be
+discovered safely; policy or automation outside the supported references above
+must be reviewed separately.
 
 ## Reconciliation invariants
 
@@ -315,7 +331,8 @@ Every controller change must preserve these invariants:
 - Pod adoption re-reads the ReplicaSet from the API server and verifies its UID
   and deletion state before taking ownership.
 - Deployment migration never orphan-deletes the source hierarchy until the
-  target ReplicaSet exists and every observed source Pod matches its selector.
+  supported dependent references point to the target GVK, the target ReplicaSet
+  exists, and every observed source Pod matches its selector.
 - Migration state is recoverable from the target Deployment and source
   ReplicaSet annotations after a controller restart.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
@@ -379,7 +396,8 @@ The acceptance suite must continue to verify:
 - `/scale` changes replica count and newly created Pods use the latest image.
 - `/scale` exposes the selector string and a real HPA can change replicas.
 - Native takeover and emergency handoff preserve live Pod identity while
-  changing the authoritative Deployment and ReplicaSet GVKs.
+  changing the authoritative Deployment and ReplicaSet GVKs, and a real HPA
+  follows the workload in both directions.
 - Deployment and ReplicaSet defaults, plus critical invalid-selector behavior,
   match their native GVKs under server-side dry-run.
 

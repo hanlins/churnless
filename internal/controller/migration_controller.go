@@ -50,13 +50,16 @@ const (
 	migrationPhaseAnnotation            = "churnless.io/migration-phase"
 	migrationRoleAnnotation             = "churnless.io/migration-role"
 
-	nativeDeploymentSource    = "apps/v1,Deployment"
-	churnlessDeploymentSource = "churnless.io/v1alpha1,Deployment"
-	migrationPhaseWarming     = "warming"
-	migrationPhaseCutover     = "cutover"
-	migrationRoleSource       = "source"
-	migrationRoleTarget       = "target"
-	annotationEnabledValue    = "true"
+	nativeDeploymentAPIVersion    = "apps/v1"
+	churnlessDeploymentAPIVersion = "churnless.io/v1alpha1"
+	deploymentKind                = "Deployment"
+	nativeDeploymentSource        = nativeDeploymentAPIVersion + "," + deploymentKind
+	churnlessDeploymentSource     = churnlessDeploymentAPIVersion + "," + deploymentKind
+	migrationPhaseWarming         = "warming"
+	migrationPhaseCutover         = "cutover"
+	migrationRoleSource           = "source"
+	migrationRoleTarget           = "target"
+	annotationEnabledValue        = "true"
 
 	sourceDeletionCost = "2147483647"
 	targetDeletionCost = "-2147483647"
@@ -213,17 +216,32 @@ func (r *MigrationReconciler) reconcileTakeover(
 	source *appsv1.Deployment,
 	target *appsv1alpha1.Deployment,
 ) (ctrl.Result, error) {
+	if source != nil && source.DeletionTimestamp.IsZero() {
+		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
+			return ctrl.Result{}, fmt.Errorf("continue takeover: %w", err)
+		}
+		if !nativeDeploymentComplete(source) {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+	changed, err := r.retargetMigrationDependents(
+		ctx,
+		target.Namespace,
+		target.Name,
+		appsv1.SchemeGroupVersion.String(),
+		appsv1alpha1.GroupVersion.String(),
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("retarget takeover dependents: %w", err)
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	if source == nil {
 		return r.finishTakeover(ctx, target)
 	}
 	if !source.DeletionTimestamp.IsZero() {
 		return r.waitForNativeSourceDeletion(ctx, target)
-	}
-	if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
-		return ctrl.Result{}, fmt.Errorf("continue takeover: %w", err)
-	}
-	if !nativeDeploymentComplete(source) {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	targetReplicaSet, ready, err := r.takeoverTargetReplicaSet(ctx, target)
@@ -237,7 +255,7 @@ func (r *MigrationReconciler) reconcileTakeover(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed, err := r.prepareMigration(
+	changed, err = r.prepareMigration(
 		ctx,
 		string(source.UID),
 		source.Namespace,
@@ -266,21 +284,36 @@ func (r *MigrationReconciler) reconcileHandoff(
 	source *appsv1alpha1.Deployment,
 	target *appsv1.Deployment,
 ) (ctrl.Result, error) {
+	if source != nil && source.DeletionTimestamp.IsZero() {
+		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
+			return ctrl.Result{}, fmt.Errorf("continue handoff: %w", err)
+		}
+		complete, err := r.churnlessDeploymentComplete(ctx, source)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !complete {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+	changed, err := r.retargetMigrationDependents(
+		ctx,
+		target.Namespace,
+		target.Name,
+		appsv1alpha1.GroupVersion.String(),
+		appsv1.SchemeGroupVersion.String(),
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("retarget handoff dependents: %w", err)
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	if source == nil {
 		return r.finishHandoff(ctx, target)
 	}
 	if !source.DeletionTimestamp.IsZero() {
 		return r.waitForChurnlessSourceDeletion(ctx, target)
-	}
-	if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
-		return ctrl.Result{}, fmt.Errorf("continue handoff: %w", err)
-	}
-	complete, err := r.churnlessDeploymentComplete(ctx, source)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !complete {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	targetReplicaSet, ready, err := r.handoffTargetReplicaSet(ctx, target)
@@ -294,7 +327,7 @@ func (r *MigrationReconciler) reconcileHandoff(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed, err := r.prepareMigration(
+	changed, err = r.prepareMigration(
 		ctx,
 		string(source.UID),
 		source.Namespace,

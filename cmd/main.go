@@ -196,7 +196,7 @@ func main() {
 	if err := (&controller.MigrationReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("migration-controller"),
+		Recorder: mgr.GetEventRecorder("migration-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "migration")
 		os.Exit(1)

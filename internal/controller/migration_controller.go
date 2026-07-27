@@ -32,7 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -77,7 +77,7 @@ type MigrationReconciler struct {
 	client.Client
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
-	Recorder  record.EventRecorder
+	Recorder  events.EventRecorder
 }
 
 type podAdoptionTarget struct {
@@ -90,7 +90,7 @@ type podAdoptionTarget struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile observes same-name native and Churnless Deployments. The target
 // Deployment records durable migration state so a transfer resumes after a
@@ -1310,7 +1310,7 @@ func (r *MigrationReconciler) event(
 	eventType, reason, message string,
 ) {
 	if r.Recorder != nil {
-		r.Recorder.Event(object, eventType, reason, message)
+		r.Recorder.Eventf(object, nil, eventType, reason, reason, message)
 	}
 }
 

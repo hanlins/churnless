@@ -272,7 +272,8 @@ kubectl annotate deployment.churnless.io/web \
 
 The annotation remains on the surviving object, so its value describes the
 current desired controller and can be changed again for a later exploration or
-fallback. A same-name target Deployment must not already exist.
+fallback. A same-name target Deployment must not already exist, and migration
+does not start from a source that is already deleting.
 
 Takeover requires a complete, stable native rollout because its normal purpose
 is an identity-preserving move from a known-good baseline. Before the target
@@ -288,6 +289,12 @@ annotations. It records the source UID, generation, original paused state,
 `preserve` or `recovery` mode, and the current `warming` or `cutover` phase on
 the target. A source spec change during migration blocks cutover so two
 different desired states cannot be silently combined.
+
+Cancellation is symmetric while the source still exists and is not deleting:
+changing either Deployment back to the source controller restores dependent
+references and source migration metadata before removing the target. Thus an
+accidental handoff can keep Churnless authoritative just as an accidental
+takeover can keep native Kubernetes authoritative.
 
 Before cutover, the target creates its ReplicaSet and temporary Pods. The
 controller then:
@@ -308,12 +315,14 @@ Pods also mean Pod objects and resource requests can briefly exceed the
 Deployment replica count, although pending or less-ready temporary Pods are
 preferred for deletion after adoption.
 
-If native ownership is requested after the native source has already started
-deletion, takeover cannot be cancelled. The controller finishes the ownership
-bookkeeping without waiting for a newly unhealthy Churnless rollout, then
-immediately starts a recovery handoff. This keeps the single desired-controller
-annotation effective throughout cutover instead of stranding the workload
-between controllers.
+If the desired controller changes after source deletion has already started,
+the current transfer can no longer be cancelled safely. The controller copies
+the new request to the surviving target, finishes the current ownership
+bookkeeping, and immediately starts the reverse transfer. In particular, a
+native fallback requested during takeover does not wait for a newly unhealthy
+Churnless rollout before starting recovery. This keeps the single
+desired-controller annotation effective throughout cutover instead of
+stranding the workload between controllers.
 
 If handoff starts while the Churnless source is incomplete, the recorded mode
 is `recovery`. The native Deployment and current native ReplicaSet are allowed
@@ -323,7 +332,9 @@ foreground-deletes the Churnless hierarchy and lets garbage collection remove
 its Pods before declaring migration complete. Recovery does not wait for
 native Pods to become Ready: the goal is to restore native desired-state
 ownership even when the copied workload spec is itself unhealthy. Pod identity
-is not preserved in this mode.
+is not preserved in this mode. A preserve-mode handoff also switches to
+recovery if the Churnless source becomes incomplete before cutover, so fallback
+cannot remain stuck waiting on the controller it is intended to replace.
 
 The migration controller emits Kubernetes Events for pending takeover,
 migration start, recovery start, cutover, cancellation, and completion. These

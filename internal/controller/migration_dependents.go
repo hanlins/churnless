@@ -114,7 +114,14 @@ func (r *MigrationReconciler) retargetMigrationDependents(
 			if !retargeted {
 				continue
 			}
-			if err := r.Patch(ctx, dependent, client.MergeFrom(before)); err != nil {
+			if err := r.Patch(
+				ctx,
+				dependent,
+				client.MergeFromWithOptions(
+					before,
+					client.MergeFromWithOptimisticLock{},
+				),
+			); err != nil {
 				return false, fmt.Errorf(
 					"retarget %s %s/%s: %w",
 					dependent.GetKind(),

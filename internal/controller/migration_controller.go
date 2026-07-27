@@ -69,6 +69,9 @@ const (
 
 	sourceDeletionCost = "2147483647"
 	targetDeletionCost = "-2147483647"
+
+	migrationPollInterval        = time.Second
+	migrationRolloutPollInterval = 2 * time.Second
 )
 
 // MigrationReconciler transfers a stable Deployment between native Kubernetes
@@ -83,6 +86,19 @@ type MigrationReconciler struct {
 type podAdoptionTarget struct {
 	object   client.Object
 	selector *metav1.LabelSelector
+}
+
+type migrationCancellation struct {
+	source            client.Object
+	target            client.Object
+	sourceReplicaSets []client.Object
+	sourceController  string
+	sourceAPIVersion  string
+	targetAPIVersion  string
+	targetDescription string
+	addedPodLabel     string
+	sourceTemplate    *corev1.PodTemplateSpec
+	completionMessage string
 }
 
 // +kubebuilder:rbac:groups=churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
@@ -152,6 +168,15 @@ func (r *MigrationReconciler) startTakeover(
 	ctx context.Context,
 	source *appsv1.Deployment,
 ) (ctrl.Result, error) {
+	if !source.DeletionTimestamp.IsZero() {
+		r.event(
+			source,
+			corev1.EventTypeWarning,
+			"MigrationBlocked",
+			"Cannot start takeover from a deleting native Deployment",
+		)
+		return ctrl.Result{}, nil
+	}
 	if !nativeDeploymentComplete(source) {
 		r.event(
 			source,
@@ -159,7 +184,7 @@ func (r *MigrationReconciler) startTakeover(
 			"MigrationPending",
 			"Waiting for the native Deployment rollout to complete before takeover",
 		)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 	}
 	target := &appsv1alpha1.Deployment{
 		ObjectMeta: migrationTargetMetadata(
@@ -189,6 +214,15 @@ func (r *MigrationReconciler) startHandoff(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 ) (ctrl.Result, error) {
+	if !source.DeletionTimestamp.IsZero() {
+		r.event(
+			source,
+			corev1.EventTypeWarning,
+			"MigrationBlocked",
+			"Cannot start handoff from a deleting Churnless Deployment",
+		)
+		return ctrl.Result{}, nil
+	}
 	complete, err := r.churnlessDeploymentComplete(ctx, source)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -264,18 +298,31 @@ func (r *MigrationReconciler) reconcileTakeover(
 	source *appsv1.Deployment,
 	target *appsv1alpha1.Deployment,
 ) (ctrl.Result, error) {
-	if source != nil && source.DeletionTimestamp.IsZero() &&
-		(source.Annotations[controllerAnnotation] == nativeControllerValue ||
-			target.Annotations[controllerAnnotation] == nativeControllerValue) {
-		return r.cancelTakeover(ctx, source, target)
-	}
 	if source != nil && source.DeletionTimestamp.IsZero() {
+		if controllerRequested(nativeControllerValue, source, target) {
+			return r.cancelTakeover(ctx, source, target)
+		}
+		if !target.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		}
 		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
 			return ctrl.Result{}, fmt.Errorf("continue takeover: %w", err)
 		}
 		if !nativeDeploymentComplete(source) {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 		}
+	} else if source != nil &&
+		source.Annotations[controllerAnnotation] == nativeControllerValue &&
+		target.Annotations[controllerAnnotation] != nativeControllerValue {
+		if err := r.setAnnotation(
+			ctx,
+			target,
+			controllerAnnotation,
+			nativeControllerValue,
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("record requested native fallback: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 	changed, err := r.retargetMigrationDependents(
 		ctx,
@@ -302,7 +349,7 @@ func (r *MigrationReconciler) reconcileTakeover(
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 	}
 	sourceReplicaSets, err := r.nativeReplicaSetsControlledBy(ctx, source)
 	if err != nil {
@@ -312,8 +359,8 @@ func (r *MigrationReconciler) reconcileTakeover(
 		ctx,
 		string(source.UID),
 		source.Namespace,
-		nativeObjects(sourceReplicaSets),
-		uidSetForNativeReplicaSets(sourceReplicaSets),
+		asClientObjects(sourceReplicaSets),
+		uidSetFor(sourceReplicaSets),
 		targetReplicaSet.Spec.Selector,
 		targetReplicaSet.UID,
 	)
@@ -335,7 +382,7 @@ func (r *MigrationReconciler) reconcileTakeover(
 	if err := r.deleteNativeSource(ctx, source, sourceReplicaSets); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
+	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 }
 
 func (r *MigrationReconciler) cancelTakeover(
@@ -343,92 +390,149 @@ func (r *MigrationReconciler) cancelTakeover(
 	source *appsv1.Deployment,
 	target *appsv1alpha1.Deployment,
 ) (ctrl.Result, error) {
-	changed, err := r.retargetMigrationDependents(
-		ctx,
-		target.Namespace,
-		target.Name,
-		appsv1alpha1.GroupVersion.String(),
-		appsv1.SchemeGroupVersion.String(),
-	)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("restore takeover dependents: %w", err)
-	}
-	if changed {
-		return ctrl.Result{Requeue: true}, nil
-	}
-	if source.Annotations[controllerAnnotation] != nativeControllerValue {
-		before := source.DeepCopy()
-		annotations := maps.Clone(source.Annotations)
-		annotations[controllerAnnotation] = nativeControllerValue
-		source.Annotations = annotations
-		if err := r.Patch(ctx, source, client.MergeFrom(before)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("mark takeover source as native: %w", err)
-		}
-		return ctrl.Result{Requeue: true}, nil
-	}
-
 	replicaSets, err := r.nativeReplicaSetsControlledBy(ctx, source)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	for _, replicaSet := range replicaSets {
-		if replicaSet.Annotations[migrationIDAnnotation] == "" {
+	return r.cancelMigration(ctx, migrationCancellation{
+		source:            source,
+		target:            target,
+		sourceReplicaSets: asClientObjects(replicaSets),
+		sourceController:  nativeControllerValue,
+		sourceAPIVersion:  appsv1.SchemeGroupVersion.String(),
+		targetAPIVersion:  appsv1alpha1.GroupVersion.String(),
+		targetDescription: "Churnless migration target",
+		addedPodLabel:     structuralRevisionLabel,
+		sourceTemplate:    &source.Spec.Template,
+		completionMessage: "Cancelled Churnless takeover; native Kubernetes remains authoritative",
+	})
+}
+
+func (r *MigrationReconciler) cancelHandoff(
+	ctx context.Context,
+	source *appsv1alpha1.Deployment,
+	target *appsv1.Deployment,
+) (ctrl.Result, error) {
+	replicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, source)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.cancelMigration(ctx, migrationCancellation{
+		source:            source,
+		target:            target,
+		sourceReplicaSets: asClientObjects(replicaSets),
+		sourceController:  churnlessControllerValue,
+		sourceAPIVersion:  appsv1alpha1.GroupVersion.String(),
+		targetAPIVersion:  appsv1.SchemeGroupVersion.String(),
+		targetDescription: "native migration target",
+		addedPodLabel:     appsv1.DefaultDeploymentUniqueLabelKey,
+		sourceTemplate:    &source.Spec.Template,
+		completionMessage: "Cancelled native handoff; Churnless remains authoritative",
+	})
+}
+
+func (r *MigrationReconciler) cancelMigration(
+	ctx context.Context,
+	cancellation migrationCancellation,
+) (ctrl.Result, error) {
+	changed, err := r.retargetMigrationDependents(
+		ctx,
+		cancellation.target.GetNamespace(),
+		cancellation.target.GetName(),
+		cancellation.targetAPIVersion,
+		cancellation.sourceAPIVersion,
+	)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("restore migration dependents: %w", err)
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if cancellation.source.GetAnnotations()[controllerAnnotation] != cancellation.sourceController {
+		if err := r.setAnnotation(
+			ctx,
+			cancellation.source,
+			controllerAnnotation,
+			cancellation.sourceController,
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("restore migration source controller: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	migrationID := cancellation.target.GetAnnotations()[migrationIDAnnotation]
+	for _, replicaSet := range cancellation.sourceReplicaSets {
+		if replicaSet.GetAnnotations()[migrationIDAnnotation] != migrationID {
 			continue
 		}
-		before := replicaSet.DeepCopy()
-		annotations := maps.Clone(replicaSet.Annotations)
+		before := replicaSet.DeepCopyObject().(client.Object)
+		annotations := maps.Clone(replicaSet.GetAnnotations())
 		delete(annotations, migrationIDAnnotation)
-		replicaSet.Annotations = annotations
+		replicaSet.SetAnnotations(annotations)
 		if err := r.Patch(ctx, replicaSet, client.MergeFrom(before)); err != nil {
 			return ctrl.Result{}, fmt.Errorf(
-				"restore native ReplicaSet %s/%s: %w",
-				replicaSet.Namespace,
-				replicaSet.Name,
+				"restore source ReplicaSet %s/%s: %w",
+				replicaSet.GetNamespace(),
+				replicaSet.GetName(),
 				err,
 			)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	pods, err := r.listPods(ctx, source.Namespace)
+	pods, err := r.listPods(ctx, cancellation.source.GetNamespace())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	sourcePods := podsControlledBy(pods, uidSetForNativeReplicaSets(replicaSets))
+	sourcePods := podsControlledBy(pods, uidSetFor(cancellation.sourceReplicaSets))
 	for i := range sourcePods {
-		if sourcePods[i].Annotations[migrationIDAnnotation] == "" {
+		if sourcePods[i].Annotations[migrationIDAnnotation] != migrationID {
 			continue
 		}
-		if err := r.restoreCancelledTakeoverPod(ctx, &sourcePods[i], source); err != nil {
+		if err := r.restoreCancelledMigrationPod(
+			ctx,
+			&sourcePods[i],
+			cancellation.sourceTemplate,
+			cancellation.addedPodLabel,
+		); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if target.DeletionTimestamp.IsZero() {
-		if err := r.Delete(ctx, target, foregroundDeleteOptions(target, true)); err != nil {
-			return ctrl.Result{}, fmt.Errorf("delete cancelled Churnless target: %w", err)
+	if cancellation.target.GetDeletionTimestamp().IsZero() {
+		if err := r.Delete(
+			ctx,
+			cancellation.target,
+			foregroundDeleteOptions(cancellation.target, true),
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"delete cancelled %s: %w",
+				cancellation.targetDescription,
+				err,
+			)
 		}
-		r.event(
-			source,
-			corev1.EventTypeNormal,
-			"MigrationCancelled",
-			"Cancelled Churnless takeover; native Kubernetes remains authoritative",
-		)
 	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
+	r.event(
+		cancellation.source,
+		corev1.EventTypeNormal,
+		"MigrationCancelled",
+		cancellation.completionMessage,
+	)
+	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) restoreCancelledTakeoverPod(
+func (r *MigrationReconciler) restoreCancelledMigrationPod(
 	ctx context.Context,
 	pod *corev1.Pod,
-	source *appsv1.Deployment,
+	sourceTemplate *corev1.PodTemplateSpec,
+	addedPodLabel string,
 ) error {
 	before := pod.DeepCopy()
-	delete(pod.Labels, structuralRevisionLabel)
+	restorePodTemplateLabel(pod, sourceTemplate, addedPodLabel)
 	delete(pod.Annotations, migrationIDAnnotation)
 	delete(pod.Annotations, migrationRoleAnnotation)
-	if value, ok := source.Spec.Template.Annotations[corev1.PodDeletionCost]; ok {
+	if value, ok := sourceTemplate.Annotations[corev1.PodDeletionCost]; ok {
 		pod.Annotations[corev1.PodDeletionCost] = value
 	} else {
 		delete(pod.Annotations, corev1.PodDeletionCost)
@@ -436,12 +540,15 @@ func (r *MigrationReconciler) restoreCancelledTakeoverPod(
 	if len(pod.Annotations) == 0 {
 		pod.Annotations = nil
 	}
+	if len(pod.Labels) == 0 {
+		pod.Labels = nil
+	}
 	if err := r.Patch(
 		ctx,
 		pod,
 		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
 	); err != nil {
-		return fmt.Errorf("restore native Pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		return fmt.Errorf("restore source Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	return nil
 }
@@ -452,9 +559,50 @@ func (r *MigrationReconciler) reconcileHandoff(
 	target *appsv1.Deployment,
 ) (ctrl.Result, error) {
 	if source != nil && source.DeletionTimestamp.IsZero() {
+		if controllerRequested(churnlessControllerValue, source, target) {
+			return r.cancelHandoff(ctx, source, target)
+		}
+		if !target.DeletionTimestamp.IsZero() {
+			return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		}
 		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
 			return ctrl.Result{}, fmt.Errorf("continue handoff: %w", err)
 		}
+		if migrationModeFor(target) == migrationModePreserve {
+			complete, err := r.churnlessDeploymentComplete(ctx, source)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !complete {
+				if err := r.setAnnotation(
+					ctx,
+					target,
+					migrationModeAnnotation,
+					migrationModeRecovery,
+				); err != nil {
+					return ctrl.Result{}, fmt.Errorf("switch handoff to recovery mode: %w", err)
+				}
+				r.event(
+					target,
+					corev1.EventTypeNormal,
+					"RecoveryHandoffStarted",
+					"Switched to recovery handoff after the Churnless rollout became incomplete",
+				)
+				return ctrl.Result{Requeue: true}, nil
+			}
+		}
+	} else if source != nil &&
+		source.Annotations[controllerAnnotation] == churnlessControllerValue &&
+		target.Annotations[controllerAnnotation] != churnlessControllerValue {
+		if err := r.setAnnotation(
+			ctx,
+			target,
+			controllerAnnotation,
+			churnlessControllerValue,
+		); err != nil {
+			return ctrl.Result{}, fmt.Errorf("record requested Churnless return: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 	changed, err := r.retargetMigrationDependents(
 		ctx,
@@ -474,7 +622,7 @@ func (r *MigrationReconciler) reconcileHandoff(
 	}
 	if !source.DeletionTimestamp.IsZero() {
 		if migrationModeFor(target) == migrationModeRecovery {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
+			return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 		}
 		return r.waitForChurnlessSourceDeletion(ctx, target)
 	}
@@ -484,7 +632,7 @@ func (r *MigrationReconciler) reconcileHandoff(
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 	}
 	if migrationModeFor(target) == migrationModeRecovery {
 		if target.Annotations[migrationPhaseAnnotation] != migrationPhaseCutover {
@@ -500,7 +648,7 @@ func (r *MigrationReconciler) reconcileHandoff(
 		if err := r.deleteChurnlessSourceForRecovery(ctx, source); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	sourceReplicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, source)
 	if err != nil {
@@ -510,8 +658,8 @@ func (r *MigrationReconciler) reconcileHandoff(
 		ctx,
 		string(source.UID),
 		source.Namespace,
-		churnlessObjects(sourceReplicaSets),
-		uidSetForChurnlessReplicaSets(sourceReplicaSets),
+		asClientObjects(sourceReplicaSets),
+		uidSetFor(sourceReplicaSets),
 		targetReplicaSet.Spec.Selector,
 		targetReplicaSet.UID,
 	)
@@ -533,7 +681,7 @@ func (r *MigrationReconciler) reconcileHandoff(
 	if err := r.deleteChurnlessSource(ctx, source, sourceReplicaSets); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
+	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 }
 
 func validateMigrationSource(target client.Object, uid types.UID, generation int64) error {
@@ -677,14 +825,14 @@ func (r *MigrationReconciler) finishTakeover(
 		if err := r.deleteNativeReplicaSets(ctx, remaining); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	replicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, target)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if len(replicaSets) == 0 {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	changed, err := r.adoptMigrationPods(
 		ctx,
@@ -705,14 +853,14 @@ func (r *MigrationReconciler) finishTakeover(
 			return ctrl.Result{}, err
 		}
 		if !complete {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 		}
 	}
 	settled, changed, err := r.cleanupMigrationPods(
 		ctx,
 		target.Namespace,
 		migrationID,
-		uidSetForChurnlessReplicaSets(replicaSets),
+		uidSetFor(replicaSets),
 		&target.Spec.Template,
 		true,
 	)
@@ -720,7 +868,7 @@ func (r *MigrationReconciler) finishTakeover(
 		return ctrl.Result{}, err
 	}
 	if !settled || changed {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	if err := r.finishMigrationTarget(ctx, target); err != nil {
 		return ctrl.Result{}, err
@@ -743,15 +891,20 @@ func (r *MigrationReconciler) waitForNativeSourceDeletion(
 	if err := r.deleteNativeReplicaSets(ctx, remaining); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
+	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 }
 
 func (r *MigrationReconciler) finishHandoff(
 	ctx context.Context,
 	target *appsv1.Deployment,
 ) (ctrl.Result, error) {
+	returningToChurnless :=
+		target.Annotations[controllerAnnotation] == churnlessControllerValue
 	if migrationModeFor(target) == migrationModeRecovery {
-		return ctrl.Result{}, r.finishMigrationTarget(ctx, target)
+		if err := r.finishMigrationTarget(ctx, target); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: returningToChurnless}, nil
 	}
 	migrationID := target.Annotations[migrationIDAnnotation]
 	remaining, err := r.churnlessReplicaSetsForMigration(ctx, target.Namespace, migrationID)
@@ -762,14 +915,14 @@ func (r *MigrationReconciler) finishHandoff(
 		if err := r.deleteChurnlessReplicaSets(ctx, remaining); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	replicaSets, err := r.nativeReplicaSetsControlledBy(ctx, target)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if len(replicaSets) == 0 {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
 	changed, err := r.adoptMigrationPods(
 		ctx,
@@ -783,14 +936,14 @@ func (r *MigrationReconciler) finishHandoff(
 	if changed {
 		return ctrl.Result{Requeue: true}, nil
 	}
-	if !nativeDeploymentComplete(target) {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	if !returningToChurnless && !nativeDeploymentComplete(target) {
+		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
 	}
 	settled, changed, err := r.cleanupMigrationPods(
 		ctx,
 		target.Namespace,
 		migrationID,
-		uidSetForNativeReplicaSets(replicaSets),
+		uidSetFor(replicaSets),
 		&target.Spec.Template,
 		false,
 	)
@@ -798,9 +951,12 @@ func (r *MigrationReconciler) finishHandoff(
 		return ctrl.Result{}, err
 	}
 	if !settled || changed {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 	}
-	return ctrl.Result{}, r.finishMigrationTarget(ctx, target)
+	if err := r.finishMigrationTarget(ctx, target); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: returningToChurnless}, nil
 }
 
 func (r *MigrationReconciler) adoptMigrationPods(
@@ -920,7 +1076,7 @@ func (r *MigrationReconciler) waitForChurnlessSourceDeletion(
 	if err := r.deleteChurnlessReplicaSets(ctx, remaining); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: time.Second}, nil
+	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
 }
 
 func (r *MigrationReconciler) cleanupMigrationPods(
@@ -961,15 +1117,22 @@ func (r *MigrationReconciler) cleanupMigrationPods(
 			delete(pod.Annotations, corev1.PodDeletionCost)
 		}
 		if takeover {
-			delete(pod.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
+			restorePodTemplateLabel(
+				pod,
+				template,
+				appsv1.DefaultDeploymentUniqueLabelKey,
+			)
 		} else {
-			delete(pod.Labels, structuralRevisionLabel)
+			restorePodTemplateLabel(pod, template, structuralRevisionLabel)
 			delete(pod.Annotations, revisionAnnotation)
 			delete(pod.Annotations, managedLabelKeysAnnotation)
 			delete(pod.Annotations, managedAnnotationKeysAnnotation)
 		}
 		if len(pod.Annotations) == 0 {
 			pod.Annotations = nil
+		}
+		if len(pod.Labels) == 0 {
+			pod.Labels = nil
 		}
 		if err := r.Patch(
 			ctx,
@@ -981,6 +1144,21 @@ func (r *MigrationReconciler) cleanupMigrationPods(
 		return true, true, nil
 	}
 	return true, false, nil
+}
+
+func restorePodTemplateLabel(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+	key string,
+) {
+	if value, ok := template.Labels[key]; ok {
+		if pod.Labels == nil {
+			pod.Labels = map[string]string{}
+		}
+		pod.Labels[key] = value
+		return
+	}
+	delete(pod.Labels, key)
 }
 
 func (r *MigrationReconciler) finishMigrationTarget(
@@ -1024,6 +1202,10 @@ func (r *MigrationReconciler) finishMigrationTarget(
 		target.GetAnnotations()[controllerAnnotation] == nativeControllerValue {
 		message = "Completed Churnless takeover cutover; continuing with requested native fallback"
 	}
+	if _, native := target.(*appsv1.Deployment); native &&
+		target.GetAnnotations()[controllerAnnotation] == churnlessControllerValue {
+		message = "Completed native handoff cutover; continuing with requested Churnless return"
+	}
 	r.event(
 		target,
 		corev1.EventTypeNormal,
@@ -1041,16 +1223,43 @@ func migrationModeFor(target client.Object) string {
 	return mode
 }
 
+func controllerRequested(value string, objects ...client.Object) bool {
+	for _, object := range objects {
+		if object.GetAnnotations()[controllerAnnotation] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *MigrationReconciler) setMigrationPhase(
 	ctx context.Context,
 	target client.Object,
 	phase string,
 ) error {
-	before := target.DeepCopyObject().(client.Object)
-	annotations := maps.Clone(target.GetAnnotations())
-	annotations[migrationPhaseAnnotation] = phase
-	target.SetAnnotations(annotations)
-	return r.Patch(ctx, target, client.MergeFrom(before))
+	return r.setAnnotation(ctx, target, migrationPhaseAnnotation, phase)
+}
+
+func (r *MigrationReconciler) setAnnotation(
+	ctx context.Context,
+	object client.Object,
+	key, value string,
+) error {
+	if object.GetAnnotations()[key] == value {
+		return nil
+	}
+	before := object.DeepCopyObject().(client.Object)
+	annotations := maps.Clone(object.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[key] = value
+	object.SetAnnotations(annotations)
+	return r.Patch(
+		ctx,
+		object,
+		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+	)
 }
 
 func (r *MigrationReconciler) takeoverTargetReplicaSet(
@@ -1342,34 +1551,18 @@ func podsControlledBy(
 	return result
 }
 
-func nativeObjects(replicaSets []*appsv1.ReplicaSet) []client.Object {
-	result := make([]client.Object, len(replicaSets))
-	for i := range replicaSets {
-		result[i] = replicaSets[i]
+func asClientObjects[T client.Object](objects []T) []client.Object {
+	result := make([]client.Object, len(objects))
+	for i := range objects {
+		result[i] = objects[i]
 	}
 	return result
 }
 
-func churnlessObjects(replicaSets []*appsv1alpha1.ReplicaSet) []client.Object {
-	result := make([]client.Object, len(replicaSets))
-	for i := range replicaSets {
-		result[i] = replicaSets[i]
-	}
-	return result
-}
-
-func uidSetForNativeReplicaSets(replicaSets []*appsv1.ReplicaSet) map[types.UID]struct{} {
-	result := make(map[types.UID]struct{}, len(replicaSets))
-	for _, replicaSet := range replicaSets {
-		result[replicaSet.UID] = struct{}{}
-	}
-	return result
-}
-
-func uidSetForChurnlessReplicaSets(replicaSets []*appsv1alpha1.ReplicaSet) map[types.UID]struct{} {
-	result := make(map[types.UID]struct{}, len(replicaSets))
-	for _, replicaSet := range replicaSets {
-		result[replicaSet.UID] = struct{}{}
+func uidSetFor[T client.Object](objects []T) map[types.UID]struct{} {
+	result := make(map[types.UID]struct{}, len(objects))
+	for _, object := range objects {
+		result[object.GetUID()] = struct{}{}
 	}
 	return result
 }

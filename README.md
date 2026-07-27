@@ -237,16 +237,20 @@ Kubernetes permits it. If the Churnless rollout is unhealthy, recovery does
 not wait for it: Churnless first creates a native ReplicaSet with the desired
 Pod count, retargets supported dependents, and then removes the Churnless
 hierarchy. Recovery prioritizes native ownership over Pod identity, and the
-native Deployment may remain unhealthy until its desired spec is fixed.
+native Deployment may remain unhealthy until its desired spec is fixed. A
+handoff that starts healthy also switches to recovery if the Churnless source
+becomes incomplete before cutover.
 
-If takeover is still in progress and the native source exists, setting
-`churnless.io/controller=native` on either Deployment cancels the takeover and
-keeps native Kubernetes authoritative. If native source deletion has already
-started, the controller finishes the ownership cutover and proceeds directly
-into recovery handoff; the same fallback command remains effective. During any
+While the source still exists and is not deleting, setting either Deployment
+back to the source controller cancels the migration, restores dependent
+references, and keeps the source authoritative. This works in both directions.
+If source deletion has already started, the controller carries the new
+desired-controller annotation onto the surviving target, finishes the current
+cutover, and immediately begins the reverse migration. The same annotation
+command therefore remains effective throughout the workflow. During any
 migration, the source spec must stay unchanged and a same-name target GVK must
-not be created manually. Temporary target Pods can briefly increase Pod and
-resource counts.
+not be created manually. Migration never starts from an already-deleting
+source. Temporary target Pods can briefly increase Pod and resource counts.
 
 This migration currently supports Deployments only. Before cutover, the
 controller automatically retargets HorizontalPodAutoscaler,

@@ -193,6 +193,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "replicaset")
 		os.Exit(1)
 	}
+	if err := (&controller.MigrationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "migration")
+		os.Exit(1)
+	}
 	if err := webhookv1alpha1.SetupDeploymentWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create webhook", "webhook", "Deployment")
 		os.Exit(1)

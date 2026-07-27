@@ -25,11 +25,23 @@ rules:
   - apps
   resources:
   - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
   - replicasets
   verbs:
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - churnless.io

@@ -569,6 +569,76 @@ spec:
 			eventuallyDeploymentPods(workload, 1, newImage)
 		})
 
+		It("should take over a native Deployment and hand it back without replacing Pods", func() {
+			const (
+				workload = "migration-switch"
+				image    = "nginx:1.28-alpine"
+				replicas = 2
+			)
+			DeferCleanup(func() {
+				for _, resource := range []string{
+					"deployment.apps/" + workload,
+					"deployment.churnless.io/" + workload,
+				} {
+					cmd := exec.Command("kubectl", "delete", resource, "--ignore-not-found")
+					_, _ = utils.Run(cmd)
+				}
+			})
+
+			By("creating a complete native Deployment")
+			Expect(applyMigrationDeployment(workload, replicas, image)).To(Succeed())
+			nativePods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+
+			By("requesting Churnless takeover with an annotation")
+			cmd := exec.Command(
+				"kubectl",
+				"annotate",
+				"deployment.apps/"+workload,
+				"churnless.io/takeover=true",
+			)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			takenOverPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1alpha1.GroupVersion.String(),
+			)
+			expectPodIdentityRetained(nativePods, takenOverPods)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment.apps/"+workload)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+			}).Should(Succeed())
+
+			By("requesting emergency handoff to the native controller")
+			cmd = exec.Command(
+				"kubectl",
+				"annotate",
+				"deployment.churnless.io/"+workload,
+				"churnless.io/handoff=true",
+			)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			handedOffPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			expectPodIdentityRetained(takenOverPods, handedOffPods)
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+			}).Should(Succeed())
+		})
+
 		It("should enforce RollingUpdate availability and surge limits", func() {
 			const (
 				workload = "rolling-policy"
@@ -907,6 +977,19 @@ func eventuallyDeploymentReplicaSet(workload, image string) replicaSetIdentity {
 }
 
 func eventuallyDeploymentPods(workload string, count int, image string) map[string]podIdentity {
+	return eventuallyOwnedDeploymentPods(
+		workload,
+		count,
+		image,
+		appsv1alpha1.GroupVersion.String(),
+	)
+}
+
+func eventuallyOwnedDeploymentPods(
+	workload string,
+	count int,
+	image, ownerAPIVersion string,
+) map[string]podIdentity {
 	var result map[string]podIdentity
 	Eventually(func(g Gomega) {
 		cmd := exec.Command(
@@ -956,7 +1039,7 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 			g.Expect(pod.Spec.Containers[0].Image).To(Equal(image))
 			g.Expect(pod.Status.PodIP).NotTo(BeEmpty())
 			g.Expect(pod.Metadata.OwnerReferences).To(ContainElement(SatisfyAll(
-				HaveField("APIVersion", "churnless.io/v1alpha1"),
+				HaveField("APIVersion", ownerAPIVersion),
 				HaveField("Kind", "ReplicaSet"),
 				HaveField("Controller", true),
 			)))
@@ -971,6 +1054,18 @@ func eventuallyDeploymentPods(workload string, count int, image string) map[stri
 		result = current
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	return result
+}
+
+func expectPodIdentityRetained(
+	before, after map[string]podIdentity,
+) {
+	Expect(after).To(HaveLen(len(before)))
+	for name, previous := range before {
+		current, ok := after[name]
+		Expect(ok).To(BeTrue(), "Pod %s was replaced", name)
+		Expect(current.UID).To(Equal(previous.UID), "Pod %s UID changed", name)
+		Expect(current.IP).To(Equal(previous.IP), "Pod %s IP changed", name)
+	}
 }
 
 func eventuallyChurnlessDeploymentComplete(workload string, replicas int32) {
@@ -996,6 +1091,34 @@ func eventuallyChurnlessDeploymentComplete(workload string, replicas int32) {
 		g.Expect(deployment.Status.InPlace).NotTo(BeNil())
 		g.Expect(deployment.Status.InPlace.ReadyUpdatedReplicas).To(Equal(replicas))
 	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+}
+
+func applyMigrationDeployment(workload string, replicas int, image string) error {
+	manifest := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+spec:
+  replicas: %d
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+      - name: nginx
+        image: %s
+        resources:
+          requests:
+            cpu: 25m
+`, workload, replicas, workload, workload, image)
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	_, err := utils.Run(cmd)
+	return err
 }
 
 func applyPolicyDeployment(

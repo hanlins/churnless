@@ -188,6 +188,34 @@ For scripts, use fully qualified resource names such as
 HPA can target the Churnless GVK directly through its standard `/scale`
 subresource.
 
+## Take over and hand off a Deployment
+
+Start with a stable, fully rolled-out Deployment. Annotate a native Deployment
+to move it to Churnless:
+
+```sh
+kubectl annotate deployment.apps/web churnless.io/takeover=true
+```
+
+The controller creates `deployment.churnless.io/web`, transfers the live Pods
+to a Churnless ReplicaSet, and removes the native Deployment and ReplicaSets.
+To hand the same workload back to Kubernetes:
+
+```sh
+kubectl annotate deployment.churnless.io/web churnless.io/handoff=true
+```
+
+The reverse transfer creates `deployment.apps/web` and moves Pod ownership
+back to its native ReplicaSet. The source must be complete, the same-name
+target GVK must not already exist, and the source spec must stay unchanged
+during migration. Temporary target Pods can briefly increase Pod and resource
+counts; ready source Pod identity is retained when Kubernetes permits it.
+
+This migration currently supports Deployments only. It does not retarget HPA
+or other objects that explicitly refer to the source GVK. See
+[DESIGN.md](DESIGN.md#takeover-and-handoff) for the ownership protocol and
+failure boundary.
+
 ## Design
 
 See [DESIGN.md](DESIGN.md) for the compatibility contract, controller

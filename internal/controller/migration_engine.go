@@ -33,11 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/events"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 )
@@ -81,13 +78,37 @@ const (
 	migrationRolloutPollInterval = 2 * time.Second
 )
 
-// MigrationReconciler transfers a stable Deployment between native Kubernetes
-// and Churnless controllers while retaining the source Pods when possible.
-type MigrationReconciler struct {
-	client.Client
-	APIReader client.Reader
-	Scheme    *runtime.Scheme
-	Recorder  events.EventRecorder
+// DeploymentMigrationEngine advances resumable Deployment transfers between
+// native Kubernetes and Churnless ownership chains.
+type DeploymentMigrationEngine struct {
+	writer client.Writer
+	reader client.Reader
+	scheme *runtime.Scheme
+}
+
+// NewDeploymentMigrationEngine constructs a transfer engine from an API
+// writer and an explicitly supplied live reader. Requiring the reader keeps a
+// future controller adapter from accidentally making cutover decisions from a
+// stale informer cache.
+func NewDeploymentMigrationEngine(
+	writer client.Writer,
+	liveReader client.Reader,
+	scheme *runtime.Scheme,
+) (*DeploymentMigrationEngine, error) {
+	switch {
+	case writer == nil:
+		return nil, fmt.Errorf("migration writer is required")
+	case liveReader == nil:
+		return nil, fmt.Errorf("live migration reader is required")
+	case scheme == nil:
+		return nil, fmt.Errorf("migration scheme is required")
+	default:
+		return &DeploymentMigrationEngine{
+			writer: writer,
+			reader: liveReader,
+			scheme: scheme,
+		}, nil
+	}
 }
 
 type podAdoptionTarget struct {
@@ -105,46 +126,31 @@ type migrationCancellation struct {
 	targetDescription string
 	addedPodLabel     string
 	sourceTemplate    *corev1.PodTemplateSpec
-	completionMessage string
 }
 
-// +kubebuilder:rbac:groups=churnless.io,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=churnless.io,resources=replicasets,verbs=get;list;watch;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-
-// Reconcile observes same-name native and Churnless Deployments. The target
-// Deployment records durable migration state so a transfer resumes after a
-// controller restart even if the source request annotation is removed.
-func (r *MigrationReconciler) Reconcile(
+// StepMigration advances one idempotent transfer step. Durable state on the
+// workload and ReplicaSets lets a later plugin invocation resume safely.
+func (r *DeploymentMigrationEngine) StepMigration(
 	ctx context.Context,
-	req ctrl.Request,
-) (ctrl.Result, error) {
-	native, err := r.getNativeDeployment(ctx, req.NamespacedName)
+	key types.NamespacedName,
+) (MigrationStep, error) {
+	native, err := r.getNativeDeployment(ctx, key)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	churnless, err := r.getChurnlessDeployment(ctx, req.NamespacedName)
+	churnless, err := r.getChurnlessDeployment(ctx, key)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 
 	switch {
 	case churnless != nil && churnless.Annotations[migrationSourceAnnotation] == nativeDeploymentSource:
-		return r.reconcileTakeover(ctx, native, churnless)
+		return r.advanceTakeover(ctx, native, churnless)
 	case native != nil && native.Annotations[migrationSourceAnnotation] == churnlessDeploymentSource:
-		return r.reconcileHandoff(ctx, churnless, native)
+		return r.advanceHandoff(ctx, churnless, native)
 	case native != nil && native.Annotations[controllerAnnotation] == churnlessControllerValue:
 		if churnless != nil {
-			r.event(
-				native,
-				corev1.EventTypeWarning,
-				"MigrationBlocked",
-				"Same-name Churnless Deployment already exists",
-			)
-			return ctrl.Result{}, fmt.Errorf(
+			return MigrationStep{}, fmt.Errorf(
 				"take over native Deployment %s/%s: same-name Churnless Deployment already exists",
 				native.Namespace,
 				native.Name,
@@ -153,13 +159,7 @@ func (r *MigrationReconciler) Reconcile(
 		return r.startTakeover(ctx, native)
 	case churnless != nil && churnless.Annotations[controllerAnnotation] == nativeControllerValue:
 		if native != nil {
-			r.event(
-				churnless,
-				corev1.EventTypeWarning,
-				"MigrationBlocked",
-				"Same-name native Deployment already exists",
-			)
-			return ctrl.Result{}, fmt.Errorf(
+			return MigrationStep{}, fmt.Errorf(
 				"hand off Churnless Deployment %s/%s: same-name native Deployment already exists",
 				churnless.Namespace,
 				churnless.Name,
@@ -167,31 +167,23 @@ func (r *MigrationReconciler) Reconcile(
 		}
 		return r.startHandoff(ctx, churnless)
 	default:
-		return ctrl.Result{}, nil
+		return MigrationStep{}, nil
 	}
 }
 
-func (r *MigrationReconciler) startTakeover(
+func (r *DeploymentMigrationEngine) startTakeover(
 	ctx context.Context,
 	source *appsv1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	if !source.DeletionTimestamp.IsZero() {
-		r.event(
-			source,
-			corev1.EventTypeWarning,
-			"MigrationBlocked",
-			"Cannot start takeover from a deleting native Deployment",
+		return MigrationStep{}, fmt.Errorf(
+			"cannot take over native Deployment %s/%s because it is deleting",
+			source.Namespace,
+			source.Name,
 		)
-		return ctrl.Result{}, nil
 	}
 	if !nativeDeploymentComplete(source) {
-		r.event(
-			source,
-			corev1.EventTypeNormal,
-			"MigrationPending",
-			"Waiting for the native Deployment rollout to complete before takeover",
-		)
-		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 	}
 	target := &appsv1alpha1.Deployment{
 		ObjectMeta: migrationTargetMetadata(
@@ -205,38 +197,26 @@ func (r *MigrationReconciler) startTakeover(
 		Spec: appsv1alpha1.DeploymentSpec{DeploymentSpec: *source.Spec.DeepCopy()},
 	}
 	target.Spec.Paused = false
-	created, err := r.createMigrationTarget(ctx, target)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("create Churnless migration target: %w", err)
+	if err := r.createMigrationTarget(ctx, target); err != nil {
+		return MigrationStep{}, fmt.Errorf("create Churnless migration target: %w", err)
 	}
-	if !created {
-		return ctrl.Result{Requeue: true}, nil
-	}
-	r.event(
-		target,
-		corev1.EventTypeNormal,
-		"MigrationStarted",
-		"Started migration from native Kubernetes to Churnless",
-	)
-	return ctrl.Result{Requeue: true}, nil
+	return MigrationStep{Requeue: true}, nil
 }
 
-func (r *MigrationReconciler) startHandoff(
+func (r *DeploymentMigrationEngine) startHandoff(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	if !source.DeletionTimestamp.IsZero() {
-		r.event(
-			source,
-			corev1.EventTypeWarning,
-			"MigrationBlocked",
-			"Cannot start handoff from a deleting Churnless Deployment",
+		return MigrationStep{}, fmt.Errorf(
+			"cannot hand off Churnless Deployment %s/%s because it is deleting",
+			source.Namespace,
+			source.Name,
 		)
-		return ctrl.Result{}, nil
 	}
 	complete, err := r.churnlessDeploymentComplete(ctx, source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	mode := migrationModePreserve
 	if !complete {
@@ -254,38 +234,27 @@ func (r *MigrationReconciler) startHandoff(
 		Spec: *source.Spec.DeploymentSpec.DeepCopy(),
 	}
 	target.Spec.Paused = false
-	created, err := r.createMigrationTarget(ctx, target)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("create native migration target: %w", err)
+	if err := r.createMigrationTarget(ctx, target); err != nil {
+		return MigrationStep{}, fmt.Errorf("create native migration target: %w", err)
 	}
-	if !created {
-		return ctrl.Result{Requeue: true}, nil
-	}
-	reason := "MigrationStarted"
-	message := "Started identity-preserving migration from Churnless to native Kubernetes"
-	if mode == migrationModeRecovery {
-		reason = "RecoveryHandoffStarted"
-		message = "Started recovery handoff to native Kubernetes without waiting for Churnless rollout completion"
-	}
-	r.event(target, corev1.EventTypeNormal, reason, message)
-	return ctrl.Result{Requeue: true}, nil
+	return MigrationStep{Requeue: true}, nil
 }
 
 // createMigrationTarget treats an existing deterministic target as progress by
-// another driver. The next reconciliation validates its durable migration
-// metadata before using it, so an unrelated same-name object still fails closed.
-func (r *MigrationReconciler) createMigrationTarget(
+// another driver. The next step validates its durable migration metadata
+// before using it, so an unrelated same-name object still fails closed.
+func (r *DeploymentMigrationEngine) createMigrationTarget(
 	ctx context.Context,
 	target client.Object,
-) (bool, error) {
-	err := r.Create(ctx, target)
+) error {
+	err := r.writer.Create(ctx, target)
 	switch {
 	case err == nil:
-		return true, nil
+		return nil
 	case apierrors.IsAlreadyExists(err):
-		return false, nil
+		return nil
 	default:
-		return false, err
+		return err
 	}
 }
 
@@ -328,26 +297,26 @@ func migrationTargetMetadata(
 	}
 }
 
-func (r *MigrationReconciler) reconcileTakeover(
+func (r *DeploymentMigrationEngine) advanceTakeover(
 	ctx context.Context,
 	source *appsv1.Deployment,
 	target *appsv1alpha1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	if err := validateMigrationTarget(target, nativeDeploymentSource, false); err != nil {
-		return ctrl.Result{}, fmt.Errorf("continue takeover: %w", err)
+		return MigrationStep{}, fmt.Errorf("continue takeover: %w", err)
 	}
 	if source != nil && source.DeletionTimestamp.IsZero() {
 		if controllerRequested(nativeControllerValue, source, target) {
 			return r.cancelTakeover(ctx, source, target)
 		}
 		if !target.DeletionTimestamp.IsZero() {
-			return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+			return MigrationStep{RetryAfter: migrationPollInterval}, nil
 		}
 		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
-			return ctrl.Result{}, fmt.Errorf("continue takeover: %w", err)
+			return MigrationStep{}, fmt.Errorf("continue takeover: %w", err)
 		}
 		if !nativeDeploymentComplete(source) {
-			return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+			return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 		}
 	} else if source != nil &&
 		source.Annotations[controllerAnnotation] == nativeControllerValue &&
@@ -358,9 +327,9 @@ func (r *MigrationReconciler) reconcileTakeover(
 			controllerAnnotation,
 			nativeControllerValue,
 		); err != nil {
-			return ctrl.Result{}, fmt.Errorf("record requested native fallback: %w", err)
+			return MigrationStep{}, fmt.Errorf("record requested native fallback: %w", err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	changed, err := r.retargetMigrationDependents(
 		ctx,
@@ -370,10 +339,10 @@ func (r *MigrationReconciler) reconcileTakeover(
 		appsv1alpha1.GroupVersion.String(),
 	)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("retarget takeover dependents: %w", err)
+		return MigrationStep{}, fmt.Errorf("retarget takeover dependents: %w", err)
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if source == nil {
 		return r.finishTakeover(ctx, target)
@@ -384,14 +353,14 @@ func (r *MigrationReconciler) reconcileTakeover(
 
 	targetReplicaSet, ready, err := r.takeoverTargetReplicaSet(ctx, target)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 	}
 	sourceReplicaSets, err := r.nativeReplicaSetsControlledBy(ctx, source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	changed, err = r.prepareMigration(
 		ctx,
@@ -403,37 +372,31 @@ func (r *MigrationReconciler) reconcileTakeover(
 		targetReplicaSet.UID,
 	)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("prepare takeover: %w", err)
+		return MigrationStep{}, fmt.Errorf("prepare takeover: %w", err)
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if target.Annotations[migrationPhaseAnnotation] != migrationPhaseCutover {
 		if err := r.setMigrationPhase(ctx, target, migrationPhaseCutover); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		r.event(
-			target,
-			corev1.EventTypeNormal,
-			"MigrationCutover",
-			"Starting Pod ownership cutover to Churnless",
-		)
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if err := r.deleteNativeSource(ctx, source, sourceReplicaSets); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+	return MigrationStep{RetryAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) cancelTakeover(
+func (r *DeploymentMigrationEngine) cancelTakeover(
 	ctx context.Context,
 	source *appsv1.Deployment,
 	target *appsv1alpha1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	replicaSets, err := r.nativeReplicaSetsControlledBy(ctx, source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	return r.cancelMigration(ctx, migrationCancellation{
 		source:            source,
@@ -445,18 +408,17 @@ func (r *MigrationReconciler) cancelTakeover(
 		targetDescription: "Churnless migration target",
 		addedPodLabel:     structuralRevisionLabel,
 		sourceTemplate:    &source.Spec.Template,
-		completionMessage: "Cancelled Churnless takeover; native Kubernetes remains authoritative",
 	})
 }
 
-func (r *MigrationReconciler) cancelHandoff(
+func (r *DeploymentMigrationEngine) cancelHandoff(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 	target *appsv1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	replicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	return r.cancelMigration(ctx, migrationCancellation{
 		source:            source,
@@ -468,14 +430,13 @@ func (r *MigrationReconciler) cancelHandoff(
 		targetDescription: "native migration target",
 		addedPodLabel:     appsv1.DefaultDeploymentUniqueLabelKey,
 		sourceTemplate:    &source.Spec.Template,
-		completionMessage: "Cancelled native handoff; Churnless remains authoritative",
 	})
 }
 
-func (r *MigrationReconciler) cancelMigration(
+func (r *DeploymentMigrationEngine) cancelMigration(
 	ctx context.Context,
 	cancellation migrationCancellation,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	changed, err := r.retargetMigrationDependents(
 		ctx,
 		cancellation.target.GetNamespace(),
@@ -484,10 +445,10 @@ func (r *MigrationReconciler) cancelMigration(
 		cancellation.sourceAPIVersion,
 	)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("restore migration dependents: %w", err)
+		return MigrationStep{}, fmt.Errorf("restore migration dependents: %w", err)
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if cancellation.source.GetAnnotations()[controllerAnnotation] != cancellation.sourceController {
 		if err := r.setAnnotation(
@@ -496,9 +457,9 @@ func (r *MigrationReconciler) cancelMigration(
 			controllerAnnotation,
 			cancellation.sourceController,
 		); err != nil {
-			return ctrl.Result{}, fmt.Errorf("restore migration source controller: %w", err)
+			return MigrationStep{}, fmt.Errorf("restore migration source controller: %w", err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 
 	migrationID := cancellation.target.GetAnnotations()[migrationIDAnnotation]
@@ -510,24 +471,24 @@ func (r *MigrationReconciler) cancelMigration(
 		annotations := maps.Clone(replicaSet.GetAnnotations())
 		delete(annotations, migrationIDAnnotation)
 		replicaSet.SetAnnotations(annotations)
-		if err := r.Patch(
+		if err := r.writer.Patch(
 			ctx,
 			replicaSet,
 			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
 		); err != nil {
-			return ctrl.Result{}, fmt.Errorf(
+			return MigrationStep{}, fmt.Errorf(
 				"restore source ReplicaSet %s/%s: %w",
 				replicaSet.GetNamespace(),
 				replicaSet.GetName(),
 				err,
 			)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 
 	pods, err := r.listPods(ctx, cancellation.source.GetNamespace())
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	sourcePods := podsControlledBy(pods, uidSetFor(cancellation.sourceReplicaSets))
 	for i := range sourcePods {
@@ -540,34 +501,28 @@ func (r *MigrationReconciler) cancelMigration(
 			cancellation.sourceTemplate,
 			cancellation.addedPodLabel,
 		); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 
 	if cancellation.target.GetDeletionTimestamp().IsZero() {
-		if err := r.Delete(
+		if err := r.writer.Delete(
 			ctx,
 			cancellation.target,
 			foregroundDeleteOptions(cancellation.target, true),
 		); err != nil {
-			return ctrl.Result{}, fmt.Errorf(
+			return MigrationStep{}, fmt.Errorf(
 				"delete cancelled %s: %w",
 				cancellation.targetDescription,
 				err,
 			)
 		}
 	}
-	r.event(
-		cancellation.source,
-		corev1.EventTypeNormal,
-		"MigrationCancelled",
-		cancellation.completionMessage,
-	)
-	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+	return MigrationStep{RetryAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) restoreCancelledMigrationPod(
+func (r *DeploymentMigrationEngine) restoreCancelledMigrationPod(
 	ctx context.Context,
 	pod *corev1.Pod,
 	sourceTemplate *corev1.PodTemplateSpec,
@@ -584,7 +539,7 @@ func (r *MigrationReconciler) restoreCancelledMigrationPod(
 	if len(pod.Labels) == 0 {
 		pod.Labels = nil
 	}
-	if err := r.Patch(
+	if err := r.writer.Patch(
 		ctx,
 		pod,
 		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
@@ -594,13 +549,13 @@ func (r *MigrationReconciler) restoreCancelledMigrationPod(
 	return nil
 }
 
-func (r *MigrationReconciler) reconcileHandoff(
+func (r *DeploymentMigrationEngine) advanceHandoff(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 	target *appsv1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	if err := validateMigrationTarget(target, churnlessDeploymentSource, true); err != nil {
-		return ctrl.Result{}, fmt.Errorf("continue handoff: %w", err)
+		return MigrationStep{}, fmt.Errorf("continue handoff: %w", err)
 	}
 	if result, proceed, err := r.prepareHandoffSource(ctx, source, target); err != nil || !proceed {
 		return result, err
@@ -613,49 +568,43 @@ func (r *MigrationReconciler) reconcileHandoff(
 		appsv1.SchemeGroupVersion.String(),
 	)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("retarget handoff dependents: %w", err)
+		return MigrationStep{}, fmt.Errorf("retarget handoff dependents: %w", err)
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if source == nil {
 		return r.finishHandoff(ctx, target)
 	}
 	if !source.DeletionTimestamp.IsZero() {
 		if migrationModeFor(target) == migrationModeRecovery {
-			return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+			return MigrationStep{RetryAfter: migrationPollInterval}, nil
 		}
 		return r.waitForChurnlessSourceDeletion(ctx, target)
 	}
 
 	targetReplicaSet, ready, err := r.handoffTargetReplicaSet(ctx, target)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 	}
 	if migrationModeFor(target) == migrationModeRecovery {
 		if target.Annotations[migrationPhaseAnnotation] != migrationPhaseCutover {
 			if err := r.setMigrationPhase(ctx, target, migrationPhaseCutover); err != nil {
-				return ctrl.Result{}, err
+				return MigrationStep{}, err
 			}
-			r.event(
-				target,
-				corev1.EventTypeNormal,
-				"MigrationCutover",
-				"Starting recovery cutover to native Kubernetes",
-			)
-			return ctrl.Result{Requeue: true}, nil
+			return MigrationStep{Requeue: true}, nil
 		}
 		if err := r.deleteChurnlessSourceForRecovery(ctx, source); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	sourceReplicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	changed, err = r.prepareMigration(
 		ctx,
@@ -667,49 +616,43 @@ func (r *MigrationReconciler) reconcileHandoff(
 		targetReplicaSet.UID,
 	)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("prepare handoff: %w", err)
+		return MigrationStep{}, fmt.Errorf("prepare handoff: %w", err)
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if target.Annotations[migrationPhaseAnnotation] != migrationPhaseCutover {
 		if err := r.setMigrationPhase(ctx, target, migrationPhaseCutover); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		r.event(
-			target,
-			corev1.EventTypeNormal,
-			"MigrationCutover",
-			"Starting Pod ownership cutover to native Kubernetes",
-		)
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if err := r.deleteChurnlessSource(ctx, source, sourceReplicaSets); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+	return MigrationStep{RetryAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) prepareHandoffSource(
+func (r *DeploymentMigrationEngine) prepareHandoffSource(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 	target *appsv1.Deployment,
-) (ctrl.Result, bool, error) {
+) (MigrationStep, bool, error) {
 	if source != nil && source.DeletionTimestamp.IsZero() {
 		if controllerRequested(churnlessControllerValue, source, target) {
 			result, err := r.cancelHandoff(ctx, source, target)
 			return result, false, err
 		}
 		if !target.DeletionTimestamp.IsZero() {
-			return ctrl.Result{RequeueAfter: migrationPollInterval}, false, nil
+			return MigrationStep{RetryAfter: migrationPollInterval}, false, nil
 		}
 		if err := validateMigrationSource(target, source.UID, source.Generation); err != nil {
-			return ctrl.Result{}, false, fmt.Errorf("continue handoff: %w", err)
+			return MigrationStep{}, false, fmt.Errorf("continue handoff: %w", err)
 		}
 		if migrationModeFor(target) == migrationModePreserve {
 			complete, err := r.churnlessDeploymentComplete(ctx, source)
 			if err != nil {
-				return ctrl.Result{}, false, err
+				return MigrationStep{}, false, err
 			}
 			if !complete {
 				if err := r.setAnnotation(
@@ -718,18 +661,12 @@ func (r *MigrationReconciler) prepareHandoffSource(
 					migrationModeAnnotation,
 					migrationModeRecovery,
 				); err != nil {
-					return ctrl.Result{}, false, fmt.Errorf(
+					return MigrationStep{}, false, fmt.Errorf(
 						"switch handoff to recovery mode: %w",
 						err,
 					)
 				}
-				r.event(
-					target,
-					corev1.EventTypeNormal,
-					"RecoveryHandoffStarted",
-					"Switched to recovery handoff after the Churnless rollout became incomplete",
-				)
-				return ctrl.Result{Requeue: true}, false, nil
+				return MigrationStep{Requeue: true}, false, nil
 			}
 		}
 	} else if source != nil &&
@@ -741,11 +678,11 @@ func (r *MigrationReconciler) prepareHandoffSource(
 			controllerAnnotation,
 			churnlessControllerValue,
 		); err != nil {
-			return ctrl.Result{}, false, fmt.Errorf("record requested Churnless return: %w", err)
+			return MigrationStep{}, false, fmt.Errorf("record requested Churnless return: %w", err)
 		}
-		return ctrl.Result{Requeue: true}, false, nil
+		return MigrationStep{Requeue: true}, false, nil
 	}
-	return ctrl.Result{}, true, nil
+	return MigrationStep{}, true, nil
 }
 
 func validateMigrationSource(target client.Object, uid types.UID, generation int64) error {
@@ -829,7 +766,7 @@ func validateMigrationTarget(
 	return nil
 }
 
-func (r *MigrationReconciler) prepareMigration(
+func (r *DeploymentMigrationEngine) prepareMigration(
 	ctx context.Context,
 	migrationID string,
 	namespace string,
@@ -849,7 +786,7 @@ func (r *MigrationReconciler) prepareMigration(
 		}
 		annotations[migrationIDAnnotation] = migrationID
 		replicaSet.SetAnnotations(annotations)
-		if err := r.Patch(
+		if err := r.writer.Patch(
 			ctx,
 			replicaSet,
 			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
@@ -911,7 +848,7 @@ func (r *MigrationReconciler) prepareMigration(
 	return false, nil
 }
 
-func (r *MigrationReconciler) preparePod(
+func (r *DeploymentMigrationEngine) preparePod(
 	ctx context.Context,
 	pod *corev1.Pod,
 	migrationID, role, deletionCost string,
@@ -936,7 +873,7 @@ func (r *MigrationReconciler) preparePod(
 		maps.Equal(before.Annotations, pod.Annotations) {
 		return false, nil
 	}
-	if err := r.Patch(
+	if err := r.writer.Patch(
 		ctx,
 		pod,
 		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
@@ -946,27 +883,27 @@ func (r *MigrationReconciler) preparePod(
 	return true, nil
 }
 
-func (r *MigrationReconciler) finishTakeover(
+func (r *DeploymentMigrationEngine) finishTakeover(
 	ctx context.Context,
 	target *appsv1alpha1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	migrationID := target.Annotations[migrationIDAnnotation]
 	remaining, err := r.nativeReplicaSetsForMigration(ctx, target.Namespace, migrationID)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if len(remaining) > 0 {
 		if err := r.deleteNativeReplicaSets(ctx, remaining); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	replicaSets, err := r.churnlessReplicaSetsControlledBy(ctx, target)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if len(replicaSets) == 0 {
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	changed, err := r.adoptMigrationPods(
 		ctx,
@@ -975,19 +912,19 @@ func (r *MigrationReconciler) finishTakeover(
 		churnlessPodAdoptionTargets(replicaSets),
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	returningToNative := target.Annotations[controllerAnnotation] == nativeControllerValue
 	if !returningToNative {
 		complete, err := r.churnlessDeploymentComplete(ctx, target)
 		if err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
 		if !complete {
-			return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+			return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 		}
 	}
 	settled, changed, err := r.cleanupMigrationPods(
@@ -999,64 +936,64 @@ func (r *MigrationReconciler) finishTakeover(
 		true,
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if !settled || changed {
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	if err := r.finishMigrationTarget(ctx, target); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{Requeue: returningToNative}, nil
+	return MigrationStep{Requeue: returningToNative}, nil
 }
 
-func (r *MigrationReconciler) waitForNativeSourceDeletion(
+func (r *DeploymentMigrationEngine) waitForNativeSourceDeletion(
 	ctx context.Context,
 	target *appsv1alpha1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	remaining, err := r.nativeReplicaSetsForMigration(
 		ctx,
 		target.Namespace,
 		target.Annotations[migrationIDAnnotation],
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if err := r.deleteNativeReplicaSets(ctx, remaining); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+	return MigrationStep{RetryAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) finishHandoff(
+func (r *DeploymentMigrationEngine) finishHandoff(
 	ctx context.Context,
 	target *appsv1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	returningToChurnless :=
 		target.Annotations[controllerAnnotation] == churnlessControllerValue
 	if migrationModeFor(target) == migrationModeRecovery {
 		if err := r.finishMigrationTarget(ctx, target); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		return ctrl.Result{Requeue: returningToChurnless}, nil
+		return MigrationStep{Requeue: returningToChurnless}, nil
 	}
 	migrationID := target.Annotations[migrationIDAnnotation]
 	remaining, err := r.churnlessReplicaSetsForMigration(ctx, target.Namespace, migrationID)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if len(remaining) > 0 {
 		if err := r.deleteChurnlessReplicaSets(ctx, remaining); err != nil {
-			return ctrl.Result{}, err
+			return MigrationStep{}, err
 		}
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	replicaSets, err := r.nativeReplicaSetsControlledBy(ctx, target)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if len(replicaSets) == 0 {
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	changed, err := r.adoptMigrationPods(
 		ctx,
@@ -1065,13 +1002,13 @@ func (r *MigrationReconciler) finishHandoff(
 		nativePodAdoptionTargets(replicaSets),
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if changed {
-		return ctrl.Result{Requeue: true}, nil
+		return MigrationStep{Requeue: true}, nil
 	}
 	if !returningToChurnless && !nativeDeploymentComplete(target) {
-		return ctrl.Result{RequeueAfter: migrationRolloutPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationRolloutPollInterval}, nil
 	}
 	settled, changed, err := r.cleanupMigrationPods(
 		ctx,
@@ -1082,18 +1019,18 @@ func (r *MigrationReconciler) finishHandoff(
 		false,
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if !settled || changed {
-		return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+		return MigrationStep{RetryAfter: migrationPollInterval}, nil
 	}
 	if err := r.finishMigrationTarget(ctx, target); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{Requeue: returningToChurnless}, nil
+	return MigrationStep{Requeue: returningToChurnless}, nil
 }
 
-func (r *MigrationReconciler) adoptMigrationPods(
+func (r *DeploymentMigrationEngine) adoptMigrationPods(
 	ctx context.Context,
 	namespace, migrationID string,
 	targets []podAdoptionTarget,
@@ -1144,7 +1081,7 @@ func (r *MigrationReconciler) adoptMigrationPods(
 		target := targets[targetIndex].object
 
 		freshTarget := target.DeepCopyObject().(client.Object)
-		if err := r.reader().Get(ctx, client.ObjectKeyFromObject(target), freshTarget); err != nil {
+		if err := r.reader.Get(ctx, client.ObjectKeyFromObject(target), freshTarget); err != nil {
 			return false, fmt.Errorf("re-read target ReplicaSet before Pod adoption: %w", err)
 		}
 		if freshTarget.GetUID() != target.GetUID() || !freshTarget.GetDeletionTimestamp().IsZero() {
@@ -1156,10 +1093,10 @@ func (r *MigrationReconciler) adoptMigrationPods(
 		}
 
 		before := pod.DeepCopy()
-		if err := controllerutil.SetControllerReference(freshTarget, pod, r.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(freshTarget, pod, r.scheme); err != nil {
 			return false, fmt.Errorf("adopt Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
-		if err := r.Patch(
+		if err := r.writer.Patch(
 			ctx,
 			pod,
 			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
@@ -1195,25 +1132,25 @@ func churnlessPodAdoptionTargets(
 	return result
 }
 
-func (r *MigrationReconciler) waitForChurnlessSourceDeletion(
+func (r *DeploymentMigrationEngine) waitForChurnlessSourceDeletion(
 	ctx context.Context,
 	target *appsv1.Deployment,
-) (ctrl.Result, error) {
+) (MigrationStep, error) {
 	remaining, err := r.churnlessReplicaSetsForMigration(
 		ctx,
 		target.Namespace,
 		target.Annotations[migrationIDAnnotation],
 	)
 	if err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
 	if err := r.deleteChurnlessReplicaSets(ctx, remaining); err != nil {
-		return ctrl.Result{}, err
+		return MigrationStep{}, err
 	}
-	return ctrl.Result{RequeueAfter: migrationPollInterval}, nil
+	return MigrationStep{RetryAfter: migrationPollInterval}, nil
 }
 
-func (r *MigrationReconciler) cleanupMigrationPods(
+func (r *DeploymentMigrationEngine) cleanupMigrationPods(
 	ctx context.Context,
 	namespace, migrationID string,
 	targetReplicaSetUIDs map[types.UID]struct{},
@@ -1264,7 +1201,7 @@ func (r *MigrationReconciler) cleanupMigrationPods(
 		if len(pod.Labels) == 0 {
 			pod.Labels = nil
 		}
-		if err := r.Patch(
+		if err := r.writer.Patch(
 			ctx,
 			pod,
 			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
@@ -1325,7 +1262,7 @@ func migrationDeletionCostSnapshot(annotations map[string]string) string {
 	return originalDeletionCostAbsent
 }
 
-func (r *MigrationReconciler) finishMigrationTarget(
+func (r *DeploymentMigrationEngine) finishMigrationTarget(
 	ctx context.Context,
 	target client.Object,
 ) error {
@@ -1355,32 +1292,13 @@ func (r *MigrationReconciler) finishMigrationTarget(
 	default:
 		return fmt.Errorf("unsupported migration target %T", target)
 	}
-	if err := r.Patch(
+	if err := r.writer.Patch(
 		ctx,
 		target,
 		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
 	); err != nil {
 		return fmt.Errorf("finish migration target: %w", err)
 	}
-	managedBy := "Churnless"
-	if _, native := target.(*appsv1.Deployment); native {
-		managedBy = "native Kubernetes"
-	}
-	message := "Deployment is now managed by " + managedBy
-	if _, churnless := target.(*appsv1alpha1.Deployment); churnless &&
-		target.GetAnnotations()[controllerAnnotation] == nativeControllerValue {
-		message = "Completed Churnless takeover cutover; continuing with requested native fallback"
-	}
-	if _, native := target.(*appsv1.Deployment); native &&
-		target.GetAnnotations()[controllerAnnotation] == churnlessControllerValue {
-		message = "Completed native handoff cutover; continuing with requested Churnless return"
-	}
-	r.event(
-		target,
-		corev1.EventTypeNormal,
-		"MigrationCompleted",
-		message,
-	)
 	return nil
 }
 
@@ -1397,7 +1315,7 @@ func controllerRequested(value string, objects ...client.Object) bool {
 	return false
 }
 
-func (r *MigrationReconciler) setMigrationPhase(
+func (r *DeploymentMigrationEngine) setMigrationPhase(
 	ctx context.Context,
 	target client.Object,
 	phase string,
@@ -1405,7 +1323,7 @@ func (r *MigrationReconciler) setMigrationPhase(
 	return r.setAnnotation(ctx, target, migrationPhaseAnnotation, phase)
 }
 
-func (r *MigrationReconciler) setAnnotation(
+func (r *DeploymentMigrationEngine) setAnnotation(
 	ctx context.Context,
 	object client.Object,
 	key, value string,
@@ -1420,14 +1338,14 @@ func (r *MigrationReconciler) setAnnotation(
 	}
 	annotations[key] = value
 	object.SetAnnotations(annotations)
-	return r.Patch(
+	return r.writer.Patch(
 		ctx,
 		object,
 		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
 	)
 }
 
-func (r *MigrationReconciler) takeoverTargetReplicaSet(
+func (r *DeploymentMigrationEngine) takeoverTargetReplicaSet(
 	ctx context.Context,
 	target *appsv1alpha1.Deployment,
 ) (*appsv1alpha1.ReplicaSet, bool, error) {
@@ -1446,7 +1364,7 @@ func (r *MigrationReconciler) takeoverTargetReplicaSet(
 		nil
 }
 
-func (r *MigrationReconciler) handoffTargetReplicaSet(
+func (r *DeploymentMigrationEngine) handoffTargetReplicaSet(
 	ctx context.Context,
 	target *appsv1.Deployment,
 ) (*appsv1.ReplicaSet, bool, error) {
@@ -1493,7 +1411,7 @@ func nativeDeploymentComplete(deployment *appsv1.Deployment) bool {
 		deployment.Status.AvailableReplicas == desired
 }
 
-func (r *MigrationReconciler) churnlessDeploymentComplete(
+func (r *DeploymentMigrationEngine) churnlessDeploymentComplete(
 	ctx context.Context,
 	deployment *appsv1alpha1.Deployment,
 ) (bool, error) {
@@ -1508,12 +1426,12 @@ func (r *MigrationReconciler) churnlessDeploymentComplete(
 	return deploymentComplete(deployment, current, replicaSets), nil
 }
 
-func (r *MigrationReconciler) nativeReplicaSetsControlledBy(
+func (r *DeploymentMigrationEngine) nativeReplicaSetsControlledBy(
 	ctx context.Context,
 	deployment *appsv1.Deployment,
 ) ([]*appsv1.ReplicaSet, error) {
 	var list appsv1.ReplicaSetList
-	if err := r.reader().List(ctx, &list, client.InNamespace(deployment.Namespace)); err != nil {
+	if err := r.reader.List(ctx, &list, client.InNamespace(deployment.Namespace)); err != nil {
 		return nil, err
 	}
 	result := make([]*appsv1.ReplicaSet, 0, len(list.Items))
@@ -1525,12 +1443,12 @@ func (r *MigrationReconciler) nativeReplicaSetsControlledBy(
 	return result, nil
 }
 
-func (r *MigrationReconciler) churnlessReplicaSetsControlledBy(
+func (r *DeploymentMigrationEngine) churnlessReplicaSetsControlledBy(
 	ctx context.Context,
 	deployment *appsv1alpha1.Deployment,
 ) ([]*appsv1alpha1.ReplicaSet, error) {
 	var list appsv1alpha1.ReplicaSetList
-	if err := r.reader().List(ctx, &list, client.InNamespace(deployment.Namespace)); err != nil {
+	if err := r.reader.List(ctx, &list, client.InNamespace(deployment.Namespace)); err != nil {
 		return nil, err
 	}
 	result := make([]*appsv1alpha1.ReplicaSet, 0, len(list.Items))
@@ -1542,12 +1460,12 @@ func (r *MigrationReconciler) churnlessReplicaSetsControlledBy(
 	return result, nil
 }
 
-func (r *MigrationReconciler) nativeReplicaSetsForMigration(
+func (r *DeploymentMigrationEngine) nativeReplicaSetsForMigration(
 	ctx context.Context,
 	namespace, migrationID string,
 ) ([]*appsv1.ReplicaSet, error) {
 	var list appsv1.ReplicaSetList
-	if err := r.reader().List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	if err := r.reader.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	result := make([]*appsv1.ReplicaSet, 0)
@@ -1559,12 +1477,12 @@ func (r *MigrationReconciler) nativeReplicaSetsForMigration(
 	return result, nil
 }
 
-func (r *MigrationReconciler) churnlessReplicaSetsForMigration(
+func (r *DeploymentMigrationEngine) churnlessReplicaSetsForMigration(
 	ctx context.Context,
 	namespace, migrationID string,
 ) ([]*appsv1alpha1.ReplicaSet, error) {
 	var list appsv1alpha1.ReplicaSetList
-	if err := r.reader().List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	if err := r.reader.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	result := make([]*appsv1alpha1.ReplicaSet, 0)
@@ -1576,33 +1494,33 @@ func (r *MigrationReconciler) churnlessReplicaSetsForMigration(
 	return result, nil
 }
 
-func (r *MigrationReconciler) deleteNativeSource(
+func (r *DeploymentMigrationEngine) deleteNativeSource(
 	ctx context.Context,
 	source *appsv1.Deployment,
 	replicaSets []*appsv1.ReplicaSet,
 ) error {
-	if err := r.Delete(ctx, source, orphanDeleteOptions(source, true)); client.IgnoreNotFound(err) != nil {
+	if err := r.writer.Delete(ctx, source, orphanDeleteOptions(source, true)); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("orphan native Deployment: %w", err)
 	}
 	return r.deleteNativeReplicaSets(ctx, replicaSets)
 }
 
-func (r *MigrationReconciler) deleteChurnlessSource(
+func (r *DeploymentMigrationEngine) deleteChurnlessSource(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 	replicaSets []*appsv1alpha1.ReplicaSet,
 ) error {
-	if err := r.Delete(ctx, source, orphanDeleteOptions(source, true)); client.IgnoreNotFound(err) != nil {
+	if err := r.writer.Delete(ctx, source, orphanDeleteOptions(source, true)); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("orphan Churnless Deployment: %w", err)
 	}
 	return r.deleteChurnlessReplicaSets(ctx, replicaSets)
 }
 
-func (r *MigrationReconciler) deleteChurnlessSourceForRecovery(
+func (r *DeploymentMigrationEngine) deleteChurnlessSourceForRecovery(
 	ctx context.Context,
 	source *appsv1alpha1.Deployment,
 ) error {
-	if err := r.Delete(
+	if err := r.writer.Delete(
 		ctx,
 		source,
 		foregroundDeleteOptions(source, true),
@@ -1612,12 +1530,12 @@ func (r *MigrationReconciler) deleteChurnlessSourceForRecovery(
 	return nil
 }
 
-func (r *MigrationReconciler) deleteNativeReplicaSets(
+func (r *DeploymentMigrationEngine) deleteNativeReplicaSets(
 	ctx context.Context,
 	replicaSets []*appsv1.ReplicaSet,
 ) error {
 	for _, replicaSet := range replicaSets {
-		if err := r.Delete(
+		if err := r.writer.Delete(
 			ctx,
 			replicaSet,
 			orphanDeleteOptions(replicaSet, false),
@@ -1628,12 +1546,12 @@ func (r *MigrationReconciler) deleteNativeReplicaSets(
 	return nil
 }
 
-func (r *MigrationReconciler) deleteChurnlessReplicaSets(
+func (r *DeploymentMigrationEngine) deleteChurnlessReplicaSets(
 	ctx context.Context,
 	replicaSets []*appsv1alpha1.ReplicaSet,
 ) error {
 	for _, replicaSet := range replicaSets {
-		if err := r.Delete(
+		if err := r.writer.Delete(
 			ctx,
 			replicaSet,
 			orphanDeleteOptions(replicaSet, false),
@@ -1679,21 +1597,12 @@ func deleteOptions(
 	}
 }
 
-func (r *MigrationReconciler) event(
-	object client.Object,
-	eventType, reason, message string,
-) {
-	if r.Recorder != nil {
-		r.Recorder.Eventf(object, nil, eventType, reason, reason, message)
-	}
-}
-
-func (r *MigrationReconciler) listPods(
+func (r *DeploymentMigrationEngine) listPods(
 	ctx context.Context,
 	namespace string,
 ) ([]corev1.Pod, error) {
 	var list corev1.PodList
-	if err := r.reader().List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	if err := r.reader.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	return list.Items, nil
@@ -1732,12 +1641,12 @@ func uidSetFor[T client.Object](objects []T) map[types.UID]struct{} {
 	return result
 }
 
-func (r *MigrationReconciler) getNativeDeployment(
+func (r *DeploymentMigrationEngine) getNativeDeployment(
 	ctx context.Context,
 	key client.ObjectKey,
 ) (*appsv1.Deployment, error) {
 	var deployment appsv1.Deployment
-	if err := r.reader().Get(ctx, key, &deployment); apierrors.IsNotFound(err) {
+	if err := r.reader.Get(ctx, key, &deployment); apierrors.IsNotFound(err) {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
@@ -1745,34 +1654,15 @@ func (r *MigrationReconciler) getNativeDeployment(
 	return &deployment, nil
 }
 
-func (r *MigrationReconciler) getChurnlessDeployment(
+func (r *DeploymentMigrationEngine) getChurnlessDeployment(
 	ctx context.Context,
 	key client.ObjectKey,
 ) (*appsv1alpha1.Deployment, error) {
 	var deployment appsv1alpha1.Deployment
-	if err := r.reader().Get(ctx, key, &deployment); apierrors.IsNotFound(err) {
+	if err := r.reader.Get(ctx, key, &deployment); apierrors.IsNotFound(err) {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
 	return &deployment, nil
-}
-
-// SetupWithManager sets up the migration controller with both Deployment GVKs.
-func (r *MigrationReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.APIReader == nil {
-		r.APIReader = mgr.GetAPIReader()
-	}
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&appsv1alpha1.Deployment{}).
-		Watches(&appsv1.Deployment{}, &handler.EnqueueRequestForObject{}).
-		Named("migration").
-		Complete(r)
-}
-
-func (r *MigrationReconciler) reader() client.Reader {
-	if r.APIReader != nil {
-		return r.APIReader
-	}
-	return r.Client
 }

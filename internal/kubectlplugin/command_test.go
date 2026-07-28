@@ -51,7 +51,21 @@ func (f *fakeTransferer) Transfer(
 	return nil
 }
 
-func TestHandoffCommandUsesNamespaceAndSharedDriver(t *testing.T) {
+type fakeRestarter struct {
+	namespace string
+	resource  string
+}
+
+func (f *fakeRestarter) Restart(
+	_ context.Context,
+	namespace, resource string,
+) (string, error) {
+	f.namespace = namespace
+	f.resource = resource
+	return "deployment.churnless.io/" + commandTestWorkload, nil
+}
+
+func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 	t.Parallel()
 
 	var output bytes.Buffer
@@ -72,12 +86,16 @@ func TestHandoffCommandUsesNamespaceAndSharedDriver(t *testing.T) {
 			runner.observe = observe
 			return runner, nil
 		},
+		func(_ *rest.Config) (restarted, error) {
+			t.Fatal("restart factory was called for handoff")
+			return nil, nil
+		},
 	)
 	command.SetArgs([]string{
 		"handoff",
 		"deployment/" + commandTestWorkload,
 		"--namespace",
-		"team",
+		restartTestNamespace,
 		"--timeout=0",
 	})
 
@@ -85,7 +103,7 @@ func TestHandoffCommandUsesNamespaceAndSharedDriver(t *testing.T) {
 		t.Fatal(err)
 	}
 	if runner.key != (types.NamespacedName{
-		Namespace: "team",
+		Namespace: restartTestNamespace,
 		Name:      commandTestWorkload,
 	}) {
 		t.Fatalf("key = %v", runner.key)
@@ -95,6 +113,54 @@ func TestHandoffCommandUsesNamespaceAndSharedDriver(t *testing.T) {
 	}
 	if got := output.String(); got !=
 		"deployment/web: handoff complete; native Kubernetes is authoritative\n" {
+		t.Fatalf("output = %q", got)
+	}
+}
+
+func TestRestartCommandUsesNamespaceAndPrintsResolvedResource(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	streams := genericclioptions.IOStreams{Out: &output, ErrOut: &output}
+	configFlags := genericclioptions.NewConfigFlags(true)
+	server := "https://127.0.0.1"
+	insecure := true
+	configFlags.APIServer = &server
+	configFlags.Insecure = &insecure
+	restarter := &fakeRestarter{}
+	command := newCommand(
+		streams,
+		configFlags,
+		func(
+			_ *rest.Config,
+			_ func(controller.MigrationProgress),
+		) (transferred, error) {
+			t.Fatal("transfer factory was called for restart")
+			return nil, nil
+		},
+		func(_ *rest.Config) (restarted, error) {
+			return restarter, nil
+		},
+	)
+	command.SetArgs([]string{
+		"rollout",
+		"restart",
+		"deployment/" + commandTestWorkload,
+		"--namespace",
+		restartTestNamespace,
+	})
+
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if restarter.namespace != restartTestNamespace {
+		t.Fatalf("namespace = %q", restarter.namespace)
+	}
+	if restarter.resource != "deployment/"+commandTestWorkload {
+		t.Fatalf("resource = %q", restarter.resource)
+	}
+	if got := output.String(); got !=
+		"deployment.churnless.io/web restarted\n" {
 		t.Fatalf("output = %q", got)
 	}
 }

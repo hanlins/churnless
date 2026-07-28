@@ -60,7 +60,7 @@ object has exactly one authoritative controller:
 | --- | --- |
 | Churnless Deployment | Chooses structural revisions, creates and scales Churnless ReplicaSets, applies rollout strategy, and aggregates status. |
 | Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, applies supported Pod metadata, image, and resource changes in place, and reports status. |
-| Migration engine | Transfers a stable Deployment and its live Pods between native Kubernetes and Churnless ownership chains. The watched controller and kubectl plugin are two drivers of this one idempotent engine. |
+| Migration engine | Transfers a stable Deployment and its live Pods between native Kubernetes and Churnless ownership chains when driven by the kubectl plugin. |
 | Admission webhooks | Apply and validate the native workload semantics that CRD schemas do not inherit from built-in API storage. |
 | kubelet | Observes patched images and resource resize requests, then restarts or resizes affected containers as required. |
 
@@ -212,31 +212,31 @@ revisions.
 ### Explicit redeploy
 
 A redeploy deliberately salts the structural revision even when the Pod
-template is otherwise unchanged. Churnless recognizes Kubernetes' standard
-restart annotation as a workload-level redeploy token:
+template is otherwise unchanged. The kubectl plugin gives native and
+Churnless Deployments one restart surface:
 
 ```sh
-kubectl annotate deployment.churnless.io/web \
-  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+kubectl churnless rollout restart deployment/web
 ```
 
-Native `kubectl rollout restart` writes the same key into a built-in
-Deployment's Pod template, and Churnless recognizes that placement too.
-However, the kubectl subcommand's compiled-in scheme rejects custom Deployment
-GVKs before sending a request, so the literal
-`kubectl rollout restart deployment.churnless.io/web` command cannot operate on
-the CRD. The generic `kubectl annotate` command above does not have that client
-limitation.
+The plugin resolves exactly one GVK, rejects an ambiguous same-name pair, and
+writes `kubectl.kubernetes.io/restartedAt` into the Pod template using a UTC
+RFC3339 token. Explicit `deployment.apps/NAME` and
+`deployment.churnless.io/NAME` forms bypass generic resolution. A paused
+Deployment is rejected because the requested restart could not progress.
+Success means the API accepted the new token; the command does not wait for
+readiness.
 
-Existing automation can alternatively set the Churnless-specific alias:
+Existing automation can set the same standard Pod-template annotation
+directly. Churnless also retains its workload-level alias:
 
 ```sh
 kubectl annotate deployment.churnless.io/web \
   churnless.io/redeploy-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
 ```
 
-Either annotation creates a new Churnless ReplicaSet and new Pods according to
-the configured rollout strategy.
+Either token creates a new Churnless ReplicaSet and new Pods according to the
+configured rollout strategy.
 
 ## In-place rollout behavior
 
@@ -266,64 +266,54 @@ identity preservation.
 
 ## Takeover and handoff
 
-The public migration control is a single desired-controller annotation:
-
-```sh
-# Native apps/v1 Deployment -> Churnless Deployment
-kubectl annotate deployment.apps/web \
-  churnless.io/controller=churnless --overwrite
-
-# Churnless Deployment -> native apps/v1 Deployment
-kubectl annotate deployment.churnless.io/web \
-  churnless.io/controller=native --overwrite
-```
-
-The ergonomic imperative surface is a kubectl plugin:
+The public transfer surface is the kubectl plugin:
 
 ```sh
 kubectl churnless takeover deployment/web
 kubectl churnless handoff deployment/web
 ```
 
-Each command records the same desired-controller annotation, repeatedly steps
-the shared migration engine through an uncached API client, reports phase
+Each command records durable desired-controller and phase state, repeatedly
+steps the reusable engine through an uncached API client, reports phase
 changes, and waits for completion. Migration state lives in Kubernetes rather
 than a local checkpoint, so interruption or timeout is safe: rerunning the same
-command resumes the operation. The watched migration controller may execute
-the same deterministic steps concurrently; optimistic patches and
-UID/resource-version delete preconditions make that safe. If another actor
-requests the opposite controller, an older synchronous command reports that it
-was superseded and stops driving instead of waiting until timeout or
-overwriting the newer intent.
+command resumes the operation. Optimistic patches and UID/resource-version
+delete preconditions make retries safe.
 
-The annotation remains on the surviving object, so its value describes the
-current desired controller and can be changed again for a later exploration or
-fallback. A same-name target Deployment must not already exist, and migration
-does not start from a source that is already deleting.
+There is intentionally no continuously running migration controller in the
+baseline architecture. Raw transfer annotations are internal checkpoints, not
+independent triggers. This makes emergency handoff depend only on the plugin
+binary, API server, and native controllers. The engine keeps a
+controller-neutral `Request`/`Inspect`/`Step` boundary so a future optional
+controller can be a thin scheduling adapter without duplicating cutover logic.
+
+If another plugin invocation requests the opposite controller, an older
+synchronous command reports that it was superseded and stops driving instead
+of overwriting the newer intent. A same-name target Deployment must not already
+exist outside valid transfer state, and migration does not start from a source
+that is already deleting.
 
 Takeover requires a complete, stable native rollout because its normal purpose
-is an identity-preserving move from a known-good baseline. Before the target
-exists, changing the native annotation back to `native` cancels the request. If
-the target exists but the native source has not started deletion, changing
-either Deployment to `native` retargets dependents back, removes migration
-metadata from native Pods and ReplicaSets, deletes the temporary Churnless
-hierarchy, and keeps native Kubernetes authoritative.
+is an identity-preserving move from a known-good baseline. Running `handoff`
+before the native source starts deletion cancels takeover, retargets dependents
+back, removes migration metadata from native Pods and ReplicaSets, deletes the
+temporary Churnless hierarchy, and keeps native Kubernetes authoritative.
 
-Handoff is always allowed to start. The migration controller creates the
-target under the other GVK with the source spec, labels, and non-migration
-annotations. It records the source UID, generation, original paused state,
+Handoff is always allowed to start. The engine creates the target under the
+other GVK with the source spec, labels, and non-migration annotations. It
+records the source UID, generation, original paused state,
 `preserve` or `recovery` mode, and the current `warming` or `cutover` phase on
 the target. A source spec change during migration blocks cutover so two
 different desired states cannot be silently combined.
 
 Cancellation is symmetric while the source still exists and is not deleting:
-changing either Deployment back to the source controller restores dependent
-references and source migration metadata before removing the target. Thus an
-accidental handoff can keep Churnless authoritative just as an accidental
-takeover can keep native Kubernetes authoritative.
+running the opposite plugin command restores dependent references and source
+migration metadata before removing the target. Thus an accidental handoff can
+keep Churnless authoritative just as an accidental takeover can keep native
+Kubernetes authoritative.
 
 Before cutover, the target creates its ReplicaSet and temporary Pods. The
-controller then:
+engine then:
 
 1. Retargets supported GVK-specific dependents to the target Deployment.
 2. Adds the target ReplicaSet's required labels to the live source Pods.
@@ -342,44 +332,37 @@ Deployment replica count, although pending or less-ready temporary Pods are
 preferred for deletion after adoption.
 
 If the desired controller changes after source deletion has already started,
-the current transfer can no longer be cancelled safely. The controller copies
+the current transfer can no longer be cancelled safely. The engine copies
 the new request to the surviving target, finishes the current ownership
 bookkeeping, and immediately starts the reverse transfer. In particular, a
 native fallback requested during takeover does not wait for a newly unhealthy
-Churnless rollout before starting recovery. This keeps the single
-desired-controller annotation effective throughout cutover instead of
-stranding the workload between controllers.
+Churnless rollout before starting recovery.
 
 If handoff starts while the Churnless source is incomplete, the recorded mode
 is `recovery`. The native Deployment and current native ReplicaSet are allowed
 to create their desired Pod count, but source Pods are not relabeled or
-adopted. After dependents point to the native GVK, the controller
+adopted. After dependents point to the native GVK, the engine
 foreground-deletes the Churnless hierarchy and lets garbage collection remove
 its Pods before declaring migration complete. Recovery does not wait for
 native Pods to become Ready: the goal is to restore native desired-state
 ownership even when the copied workload spec is itself unhealthy. Pod identity
 is not preserved in this mode. A preserve-mode handoff also switches to
 recovery if the Churnless source becomes incomplete before cutover, so fallback
-cannot remain stuck waiting on the controller it is intended to replace.
-
-The migration controller emits Kubernetes Events for pending takeover,
-migration start, recovery start, cutover, cancellation, and completion. These
-events are the user-facing progress and diagnostic surface while both GVKs
-temporarily coexist. Events are optional observability, never required
-migration state; the kubectl plugin reports progress directly and does not
-require Event-create permission.
+cannot remain stuck waiting on the controller it is intended to replace. The
+plugin reports progress from persisted state and does not require Event-create
+permission.
 
 An emergency handoff can complete while the entire Churnless manager is down.
 Metadata-only source and ReplicaSet updates do not call the unavailable
-webhooks, the plugin replaces the watched migration loop, and native
-Deployment/ReplicaSet controllers warm the destination. Healthy handoff can
-still preserve Pod identity; an incomplete Churnless source uses recovery
-handoff as described above. The plugin cannot make a Churnless target
+webhooks, and native Deployment/ReplicaSet controllers warm the destination
+while the plugin advances the transfer. Healthy handoff can still preserve Pod
+identity; an incomplete Churnless source uses recovery handoff as described
+above. The plugin cannot make a Churnless target
 operational without the Churnless admission, Deployment, and ReplicaSet
 controllers, so takeover still requires a healthy Churnless manager.
 
 Migration currently covers Deployments, not standalone ReplicaSets. The
-controller rewrites these namespaced workload references when they point to
+engine rewrites these namespaced workload references when they point to
 the same-name source Deployment:
 
 - `autoscaling/v2` HorizontalPodAutoscaler `spec.scaleTargetRef`
@@ -422,14 +405,17 @@ Every controller change must preserve these invariants:
   supported dependents point to the native GVK and the native ReplicaSet has
   created its desired Pod count.
 - Migration state is recoverable from the target Deployment and source
-  ReplicaSet annotations after a controller restart.
+  ReplicaSet annotations after plugin interruption.
 - Durable migration state has an explicit version and fails closed on an
   unknown version, phase, mode, or desired-controller value before ownership
   is orphaned.
 - Per-Pod deletion cost is recorded before migration preference is applied and
   restored exactly after completion or cancellation.
-- The watched controller and synchronous kubectl driver execute the same
-  migration state machine; neither carries a second cutover implementation.
+- The kubectl driver owns scheduling while the reusable migration engine owns
+  all transfer semantics; a future controller must adapt that engine rather
+  than implement a second cutover path.
+- The baseline manager does not watch transfer annotations or receive
+  transfer-only Deployment, autoscaler, KEDA, VPA, or Event permissions.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
   another batch from stale informer state.
 - Structural rollout scale-up continues counting observed active ReplicaSet
@@ -446,9 +432,9 @@ Every controller change must preserve these invariants:
 
 Internal labels and annotations under `churnless.io/` must not become the only
 source of ownership; Kubernetes controller owner references remain
-authoritative. The documented `in-place-resources`, `redeploy-at`, and
-`controller` annotations are public controls; other keys in that namespace
-remain controller implementation details.
+authoritative. The documented `in-place-resources` and `redeploy-at`
+annotations are public controls. Transfer annotations, including
+`churnless.io/controller`, are plugin-managed implementation details.
 
 ## Compatibility boundary
 
@@ -460,8 +446,8 @@ current `v1alpha1` implementation still has known gaps:
   Kubernetes library; it cannot discover different feature-gate settings or
   unrelated admission plugins configured on the hosting API server.
 - Built-in `kubectl rollout` subcommands use a compiled-in typed scheme and
-  cannot operate directly on the Churnless CRD. Use the documented standard
-  restart annotation with generic `kubectl annotate`.
+  cannot operate directly on the Churnless CRD. Use
+  `kubectl churnless rollout restart`.
 - Image revisions reuse one ReplicaSet, so they are not separate ReplicaSet
   history entries.
 - Progress-deadline enforcement, revision-history cleanup, hash-collision
@@ -487,7 +473,8 @@ The acceptance suite must continue to verify:
 - Best-effort CPU/memory changes either retain Pod identity through `resize` or
   converge by controlled replacement when resize is rejected.
 - Structural changes create a different ReplicaSet.
-- `kubectl.kubernetes.io/restartedAt` and `churnless.io/redeploy-at` create a
+- `kubectl churnless rollout restart` resolves native and Churnless
+  Deployments, and its `kubectl.kubernetes.io/restartedAt` token creates a
   different ReplicaSet and new Pods.
 - RollingUpdate stays within its availability and surge fenceposts, and
   Recreate never runs old and new revisions at the same time.

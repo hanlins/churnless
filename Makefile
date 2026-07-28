@@ -31,6 +31,8 @@ BENCHMARK_NEW_IMAGE ?= registry.k8s.io/pause:3.10
 # Build local tools with the same Go toolchain used by this module.
 PROJECT_GO_TOOLCHAIN ?= $(shell go env GOVERSION)
 PLUGIN_BIN ?= $(LOCALBIN)/kubectl-churnless
+PLUGIN_INSTALL_DIR ?= $(GOBIN)
+PLUGIN_CGO_ENABLED ?= 0
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -193,12 +195,23 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: build-plugin
 build-plugin: $(LOCALBIN) ## Build the kubectl-churnless plugin.
-	go build -trimpath -o "$(PLUGIN_BIN)" ./cmd/kubectl-churnless
+	CGO_ENABLED="$(PLUGIN_CGO_ENABLED)" go build -trimpath -o "$(PLUGIN_BIN)" ./cmd/kubectl-churnless
 
 .PHONY: install-plugin
-install-plugin: build-plugin ## Install kubectl-churnless into GOPATH/bin or GOBIN.
-	mkdir -p "$(GOBIN)"
-	cp "$(PLUGIN_BIN)" "$(GOBIN)/kubectl-churnless"
+install-plugin: ## Install and verify kubectl-churnless discovery.
+	mkdir -p "$(PLUGIN_INSTALL_DIR)"
+	CGO_ENABLED="$(PLUGIN_CGO_ENABLED)" GOBIN="$(PLUGIN_INSTALL_DIR)" \
+		go install -trimpath ./cmd/kubectl-churnless
+	@command -v "$(KUBECTL)" >/dev/null 2>&1 || { \
+		echo "$(KUBECTL) is required to use the installed plugin."; \
+		exit 1; \
+	}
+	@PATH="$(PLUGIN_INSTALL_DIR):$$PATH" "$(KUBECTL)" churnless --help >/dev/null
+	@echo "Installed and verified $(PLUGIN_INSTALL_DIR)/kubectl-churnless"
+	@case ":$$PATH:" in \
+		*":$(PLUGIN_INSTALL_DIR):"*) ;; \
+		*) echo 'Add it to this shell with: export PATH="$(PLUGIN_INSTALL_DIR):$$PATH"' ;; \
+	esac
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

@@ -25,7 +25,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
@@ -54,13 +53,16 @@ type MigrationProgress struct {
 }
 
 // MigrationStep is the controller-neutral scheduling result of one idempotent
-// migration step.
+// migration step. RetryAfter takes precedence over Requeue, and scheduling is
+// ignored when the step returns an error.
 type MigrationStep struct {
+	Requeue    bool
 	RetryAfter time.Duration
 }
 
-// MigrationEngine is the shared migration surface used by the controller loop
-// and synchronous clients such as kubectl-churnless.
+// MigrationEngine is the reusable transfer surface driven by kubectl-churnless.
+// A future controller can adapt this same step API without owning transfer
+// semantics.
 type MigrationEngine interface {
 	RequestMigration(context.Context, types.NamespacedName, MigrationDestination) error
 	InspectMigration(
@@ -71,16 +73,16 @@ type MigrationEngine interface {
 	StepMigration(context.Context, types.NamespacedName) (MigrationStep, error)
 }
 
-// MigrationDriver synchronously drives the same idempotent state machine used
-// by MigrationReconciler. Interrupted commands leave durable state in the API;
-// running the same transfer again resumes it.
+// MigrationDriver synchronously drives an idempotent migration engine.
+// Interrupted commands leave durable state in the API; running the same
+// transfer again resumes it.
 type MigrationDriver struct {
 	Engine       MigrationEngine
 	PollInterval time.Duration
 	Observe      func(MigrationProgress)
 }
 
-// Transfer requests the destination controller and drives reconciliation until
+// Transfer requests the destination controller and drives transfer steps until
 // that controller is authoritative or the context ends.
 func (d *MigrationDriver) Transfer(
 	ctx context.Context,
@@ -128,13 +130,13 @@ func (d *MigrationDriver) Transfer(
 
 	lastProgress = progress
 	for {
-		step, reconcileErr := d.Engine.StepMigration(ctx, key)
-		if reconcileErr != nil && !retryableMigrationError(reconcileErr) {
+		step, stepErr := d.Engine.StepMigration(ctx, key)
+		if stepErr != nil && !retryableMigrationError(stepErr) {
 			return migrationOperationError(
 				ctx,
 				lastProgress,
 				"drive migration",
-				reconcileErr,
+				stepErr,
 			)
 		}
 
@@ -161,13 +163,30 @@ func (d *MigrationDriver) Transfer(
 			}
 		}
 
-		delay := step.RetryAfter
-		if delay <= 0 {
-			delay = pollInterval
+		immediate, delay := migrationStepSchedule(step, stepErr, pollInterval)
+		if immediate {
+			continue
 		}
 		if err := waitForMigrationRetry(ctx, delay); err != nil {
 			return migrationOperationError(ctx, lastProgress, "wait for migration", err)
 		}
+	}
+}
+
+func migrationStepSchedule(
+	step MigrationStep,
+	stepErr error,
+	defaultDelay time.Duration,
+) (immediate bool, delay time.Duration) {
+	switch {
+	case stepErr != nil:
+		return false, defaultDelay
+	case step.RetryAfter > 0:
+		return false, step.RetryAfter
+	case step.Requeue:
+		return true, 0
+	default:
+		return false, defaultDelay
 	}
 }
 
@@ -177,19 +196,9 @@ func (d *MigrationDriver) observe(progress MigrationProgress) {
 	}
 }
 
-// StepMigration advances the reconciler once without exposing
-// controller-runtime request and scheduling types to synchronous clients.
-func (r *MigrationReconciler) StepMigration(
-	ctx context.Context,
-	key types.NamespacedName,
-) (MigrationStep, error) {
-	result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
-	return MigrationStep{RetryAfter: result.RequeueAfter}, err
-}
-
 // RequestMigration records the desired controller on the authoritative source,
 // or on the surviving target when cutover has already removed that source.
-func (r *MigrationReconciler) RequestMigration(
+func (r *DeploymentMigrationEngine) RequestMigration(
 	ctx context.Context,
 	key types.NamespacedName,
 	destination MigrationDestination,
@@ -257,7 +266,7 @@ func migrationRequestTarget(
 }
 
 // InspectMigration reports persisted migration state without mutating it.
-func (r *MigrationReconciler) InspectMigration(
+func (r *DeploymentMigrationEngine) InspectMigration(
 	ctx context.Context,
 	key types.NamespacedName,
 	destination MigrationDestination,

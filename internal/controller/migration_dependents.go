@@ -70,11 +70,7 @@ var migrationDependentReferences = []migrationDependentReference{
 	},
 }
 
-// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups=autoscaling.k8s.io,resources=verticalpodautoscalers,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;patch
-
-func (r *MigrationReconciler) retargetMigrationDependents(
+func (r *DeploymentMigrationEngine) retargetMigrationDependents(
 	ctx context.Context,
 	namespace, workload, sourceAPIVersion, targetAPIVersion string,
 ) (bool, error) {
@@ -82,7 +78,7 @@ func (r *MigrationReconciler) retargetMigrationDependents(
 	for _, reference := range migrationDependentReferences {
 		var dependents unstructured.UnstructuredList
 		dependents.SetGroupVersionKind(reference.listGVK)
-		if err := r.reader().List(
+		if err := r.reader.List(
 			ctx,
 			&dependents,
 			client.InNamespace(namespace),
@@ -114,7 +110,7 @@ func (r *MigrationReconciler) retargetMigrationDependents(
 			if !retargeted {
 				continue
 			}
-			if err := r.Patch(
+			if err := r.writer.Patch(
 				ctx,
 				dependent,
 				client.MergeFromWithOptions(

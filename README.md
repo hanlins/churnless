@@ -150,13 +150,15 @@ rollout availability budget.
 Explicitly replace every Pod even when the template is otherwise unchanged:
 
 ```sh
-kubectl annotate deployment.churnless.io/deployment-sample \
-  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+kubectl churnless rollout restart deployment/deployment-sample
 ```
 
-The built-in `kubectl rollout restart` command cannot decode custom Deployment
-GVKs. Churnless accepts its standard annotation key through generic
-`kubectl annotate`; `churnless.io/redeploy-at` remains an equivalent alias.
+The plugin resolves whether the name belongs to a native or Churnless
+Deployment, writes Kubernetes' standard restart annotation to its Pod
+template, and prints the resolved GVK. Use an explicit resource such as
+`deployment.apps/web` or `deployment.churnless.io/web` if both GVKs exist.
+The command records the restart request; it does not wait for rollout
+completion.
 
 Clean up:
 
@@ -190,18 +192,15 @@ subresource.
 
 ## Explore an existing Deployment and fall back
 
-Churnless uses one desired-controller annotation for the whole workflow:
-`churnless.io/controller=churnless|native`.
-
-Build and install the kubectl plugin from a checkout. Ensure Go's bin
-directory is on `PATH` so kubectl can discover the `kubectl-churnless`
-executable:
+Build, install, and verify the kubectl plugin from a checkout:
 
 ```sh
 make install-plugin
-kubectl plugin list
 kubectl churnless --help
 ```
+
+The install target prints the exact `PATH` export when Go's bin directory is
+not already discoverable by kubectl. It does not edit shell startup files.
 
 Before starting, wait for the native Deployment to finish its rollout and
 pause any GitOps or other automation that would recreate the deleted source
@@ -219,69 +218,55 @@ Move the workload to Churnless:
 kubectl churnless takeover deployment/web
 ```
 
-The command requests `churnless.io/controller=churnless`, drives the same
-idempotent migration engine used by the in-cluster controller, waits for
-completion, and prints phase changes. It creates
-`deployment.churnless.io/web`, transfers the live Pods, and leaves the desired
-controller annotation on the surviving object. A timeout or interruption does
-not roll state back; rerun the same command to resume from the durable target
-metadata. If another operator requests the opposite controller while the
-command is running, the older command exits with a superseded message instead
-of fighting the newer intent.
+The command uses the current kubeconfig context and namespace plus the caller's
+Kubernetes permissions. It creates `deployment.churnless.io/web`, drives the
+resumable transfer engine directly, waits for completion, and reports phase
+changes. Transfer checkpoints live on the Kubernetes objects, so a timeout or
+interruption does not roll state back; rerun the same command to resume.
+The caller therefore needs read/write access to both workload GVKs, their
+ReplicaSets and Pods, plus any supported autoscaler references being retargeted.
 
-Return to the native controller at any time:
+Return to native Kubernetes:
 
 ```sh
 kubectl churnless handoff deployment/web
 ```
 
-`handoff` remains usable when the complete Churnless manager, including its
-migration controller and admission server, is unavailable. Metadata-only
-updates bypass the Churnless webhooks, while creates and spec-changing updates
-remain fail-closed. The plugin coordinates the transfer directly through the
-Kubernetes API, and the native Deployment and ReplicaSet controllers warm the
-target. A takeover still requires the Churnless admission and workload
-controllers because only they can make a Churnless target operational.
-
-The annotation-only workflow remains available for declarative automation:
-
-```sh
-kubectl annotate deployment.apps/web \
-  churnless.io/controller=churnless --overwrite
-kubectl annotate deployment.churnless.io/web \
-  churnless.io/controller=native --overwrite
-```
+`handoff` remains usable when the complete Churnless manager and admission
+server are unavailable. Metadata-only bookkeeping bypasses the unavailable
+webhooks, the plugin drives the operation, and Kubernetes' native Deployment
+and ReplicaSet controllers warm the target. Takeover still requires a healthy
+Churnless manager because the Churnless target must become operational.
 
 When the Churnless rollout is healthy, handoff retains ready Pod identity when
 Kubernetes permits it. If the Churnless rollout is unhealthy, recovery does
-not wait for it: Churnless first creates a native ReplicaSet with the desired
-Pod count, retargets supported dependents, and then removes the Churnless
-hierarchy. Recovery prioritizes native ownership over Pod identity, and the
-native Deployment may remain unhealthy until its desired spec is fixed. A
-handoff that starts healthy also switches to recovery if the Churnless source
-becomes incomplete before cutover.
+not wait for it: the plugin creates a native Deployment, Kubernetes warms its
+native ReplicaSet to the desired Pod count, the plugin retargets supported
+dependents, and then it removes the Churnless hierarchy. Recovery prioritizes
+native ownership over Pod identity, and the native Deployment may remain
+unhealthy until its desired spec is fixed. A handoff that starts healthy also
+switches to recovery if the Churnless source becomes incomplete before
+cutover.
 
-While the source still exists and is not deleting, setting either Deployment
-back to the source controller cancels the migration, restores dependent
-references, and keeps the source authoritative. This works in both directions.
-If source deletion has already started, the controller carries the new
-desired-controller annotation onto the surviving target, finishes the current
-cutover, and immediately begins the reverse migration. The same annotation
-command therefore remains effective throughout the workflow. During any
-migration, the source spec must stay unchanged and a same-name target GVK must
-not be created manually. Migration never starts from an already-deleting
+Run the opposite plugin command to reverse an in-progress operation. While the
+source still exists, the engine cancels safely and restores dependent
+references. After source deletion begins, it finishes the ownership cutover
+and then starts the reverse transfer. Raw `churnless.io/controller`
+annotations are durable engine state, not a public trigger; changing one
+without running the plugin does not advance a transfer.
+
+During a transfer, keep the source spec unchanged and do not create the
+same-name target GVK manually. Transfers never start from an already-deleting
 source. Temporary target Pods can briefly increase Pod and resource counts.
 
-Inspect current objects and controller-driven Events with:
+Inspect current objects with:
 
 ```sh
 kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
-kubectl get events --field-selector involvedObject.name=web \
-  --sort-by=.lastTimestamp
 ```
 
 This migration currently supports Deployments only. Before cutover, the
-shared migration engine automatically retargets HorizontalPodAutoscaler,
+plugin's transfer engine automatically retargets HorizontalPodAutoscaler,
 VerticalPodAutoscaler, and KEDA ScaledObject references to the new Deployment
 GVK. Services, PodDisruptionBudgets, and other selector-based resources keep
 matching the same Pod labels. Custom resources with other explicit workload

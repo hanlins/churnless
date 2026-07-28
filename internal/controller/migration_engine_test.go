@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 )
@@ -41,7 +40,7 @@ const (
 	invalidMigrationState  = "unknown"
 )
 
-var _ = Describe("Migration Controller", func() {
+var _ = Describe("Deployment migration engine", func() {
 	const (
 		namespace             = migrationTestNamespace
 		image                 = migrationTestImage
@@ -49,10 +48,35 @@ var _ = Describe("Migration Controller", func() {
 	)
 
 	ctx := context.Background()
-	reconciler := &MigrationReconciler{}
+	var engine *DeploymentMigrationEngine
 
 	BeforeEach(func() {
-		reconciler = &MigrationReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		var err error
+		engine, err = NewDeploymentMigrationEngine(
+			k8sClient,
+			k8sClient,
+			k8sClient.Scheme(),
+		)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("requires explicit live API dependencies", func() {
+		_, err := NewDeploymentMigrationEngine(
+			nil,
+			k8sClient,
+			k8sClient.Scheme(),
+		)
+		Expect(err).To(MatchError("migration writer is required"))
+
+		_, err = NewDeploymentMigrationEngine(
+			k8sClient,
+			nil,
+			k8sClient.Scheme(),
+		)
+		Expect(err).To(MatchError("live migration reader is required"))
+
+		_, err = NewDeploymentMigrationEngine(k8sClient, k8sClient, nil)
+		Expect(err).To(MatchError("migration scheme is required"))
 	})
 
 	AfterEach(func() {
@@ -64,6 +88,7 @@ var _ = Describe("Migration Controller", func() {
 			"cancel-handoff-test",
 			"degrade-test",
 			"deleting-source-test",
+			"deleting-handoff-source-test",
 			"deleting-target-test",
 			"late-return-test",
 			"adoption-test",
@@ -135,9 +160,9 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, hpa)).To(Succeed())
 
-		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		result, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.RequeueAfter).NotTo(BeZero())
+		Expect(result.RetryAfter).NotTo(BeZero())
 		var target appsv1alpha1.Deployment
 		Expect(k8sClient.Get(ctx, key, &target)).To(MatchError(ContainSubstring("not found")))
 
@@ -150,7 +175,7 @@ var _ = Describe("Migration Controller", func() {
 			AvailableReplicas:  replicas,
 		}
 		Expect(k8sClient.Status().Update(ctx, source)).To(Succeed())
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		_, err = engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, key, &target)).To(Succeed())
@@ -165,7 +190,7 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Spec.Paused).To(BeFalse())
 		Expect(target.Spec.Template).To(Equal(source.Spec.Template))
 
-		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		_, err = engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, key, hpa)).To(Succeed())
 		Expect(hpa.Spec.ScaleTargetRef.APIVersion).
@@ -205,13 +230,13 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
 		targetUID := target.UID
 
-		result, err := reconciler.startTakeover(ctx, source)
+		result, err := engine.startTakeover(ctx, source)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(reconcile.Result{Requeue: true}))
+		Expect(result).To(Equal(MigrationStep{Requeue: true}))
 		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		Expect(target.UID).To(Equal(targetUID))
 
-		progress, err := reconciler.InspectMigration(
+		progress, err := engine.InspectMigration(
 			ctx,
 			key,
 			MigrationDestinationChurnless,
@@ -278,7 +303,7 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Status().Update(ctx, replicaSet)).To(Succeed())
 
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		_, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
 
 		var target appsv1.Deployment
@@ -306,7 +331,7 @@ var _ = Describe("Migration Controller", func() {
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 
-		Expect(reconciler.RequestMigration(
+		Expect(engine.RequestMigration(
 			ctx,
 			key,
 			MigrationDestinationNative,
@@ -339,12 +364,13 @@ var _ = Describe("Migration Controller", func() {
 			Client:       k8sClient,
 			deleteObject: source.DeepCopy(),
 		}
-		racingReconciler := &MigrationReconciler{
-			Client:    racingClient,
-			APIReader: racingClient,
-			Scheme:    k8sClient.Scheme(),
-		}
-		Expect(racingReconciler.RequestMigration(
+		racingEngine, err := NewDeploymentMigrationEngine(
+			racingClient,
+			racingClient,
+			k8sClient.Scheme(),
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(racingEngine.RequestMigration(
 			ctx,
 			key,
 			MigrationDestinationChurnless,
@@ -383,7 +409,7 @@ var _ = Describe("Migration Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, target)).To(Succeed())
 
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			_, err := engine.StepMigration(ctx, key)
 			Expect(err).To(MatchError(ContainSubstring(expectedError)))
 			Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 			Expect(source.DeletionTimestamp.IsZero()).To(BeTrue())
@@ -446,7 +472,7 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		_, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
 
 		var target appsv1.Deployment
@@ -459,7 +485,7 @@ var _ = Describe("Migration Controller", func() {
 			To(Equal(source.Spec.Template.Spec.Containers[0].Image))
 	})
 
-	It("does not start takeover from a deleting native Deployment", func() {
+	It("fails takeover from a deleting native Deployment", func() {
 		const name = "deleting-source-test"
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := nativeMigrationTestDeployment(
@@ -483,10 +509,32 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		Expect(source.DeletionTimestamp.IsZero()).To(BeFalse())
 
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-		Expect(err).NotTo(HaveOccurred())
+		_, err := engine.StepMigration(ctx, key)
+		Expect(err).To(MatchError(ContainSubstring(
+			"cannot take over native Deployment default/deleting-source-test because it is deleting",
+		)))
 
 		var target appsv1alpha1.Deployment
+		Expect(k8sClient.Get(ctx, key, &target)).To(Satisfy(apierrors.IsNotFound))
+	})
+
+	It("fails handoff from a deleting Churnless Deployment", func() {
+		const name = "deleting-handoff-source-test"
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		source := churnlessMigrationTestDeployment(name, nativeControllerValue)
+		source.Finalizers = []string{testDeletionFinalizer}
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+		clearFinalizersAfterTest(ctx, source)
+		Expect(k8sClient.Delete(ctx, source)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		Expect(source.DeletionTimestamp.IsZero()).To(BeFalse())
+
+		_, err := engine.StepMigration(ctx, key)
+		Expect(err).To(MatchError(ContainSubstring(
+			"cannot hand off Churnless Deployment default/deleting-handoff-source-test because it is deleting",
+		)))
+
+		var target appsv1.Deployment
 		Expect(k8sClient.Get(ctx, key, &target)).To(Satisfy(apierrors.IsNotFound))
 	})
 
@@ -518,9 +566,9 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		Expect(target.DeletionTimestamp.IsZero()).To(BeFalse())
 
-		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		result, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.RequeueAfter).NotTo(BeZero())
+		Expect(result.RetryAfter).NotTo(BeZero())
 		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		Expect(source.DeletionTimestamp.IsZero()).To(BeTrue())
 		Expect(source.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
@@ -575,7 +623,7 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Create(ctx, hpa)).To(Succeed())
 
 		Eventually(func(g Gomega) {
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			_, err := engine.StepMigration(ctx, key)
 			g.Expect(err).NotTo(HaveOccurred())
 			err = k8sClient.Get(ctx, key, target)
 			g.Expect(err == nil || apierrors.IsNotFound(err)).To(BeTrue())
@@ -629,7 +677,7 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Create(ctx, hpa)).To(Succeed())
 
 		Eventually(func(g Gomega) {
-			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			_, err := engine.StepMigration(ctx, key)
 			g.Expect(err).NotTo(HaveOccurred())
 			err = k8sClient.Get(ctx, key, target)
 			g.Expect(err == nil || apierrors.IsNotFound(err)).To(BeTrue())
@@ -666,7 +714,7 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
 
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		_, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModeRecovery))
@@ -719,9 +767,9 @@ var _ = Describe("Migration Controller", func() {
 		source.Annotations[controllerAnnotation] = churnlessControllerValue
 		Expect(k8sClient.Update(ctx, source)).To(Succeed())
 
-		result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		result, err := engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(reconcile.Result{Requeue: true}))
+		Expect(result).To(Equal(MigrationStep{Requeue: true}))
 		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		Expect(target.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
 
@@ -732,9 +780,9 @@ var _ = Describe("Migration Controller", func() {
 			return apierrors.IsNotFound(err)
 		}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
 
-		result, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		result, err = engine.StepMigration(ctx, key)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(reconcile.Result{Requeue: true}))
+		Expect(result).To(Equal(MigrationStep{Requeue: true}))
 		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		Expect(target.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
 		Expect(target.Annotations).NotTo(HaveKey(migrationSourceAnnotation))
@@ -758,7 +806,7 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
-		changed, err := reconciler.preparePod(
+		changed, err := engine.preparePod(
 			ctx,
 			pod,
 			"migration-uid",
@@ -776,7 +824,7 @@ var _ = Describe("Migration Controller", func() {
 
 		sourceTemplate := podTemplate(name, image)
 		sourceTemplate.Labels[structuralRevisionLabel] = "original"
-		Expect(reconciler.restoreCancelledMigrationPod(
+		Expect(engine.restoreCancelledMigrationPod(
 			ctx,
 			pod,
 			&sourceTemplate,
@@ -852,7 +900,7 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
-		changed, err := reconciler.adoptMigrationPods(
+		changed, err := engine.adoptMigrationPods(
 			ctx,
 			namespace,
 			"migration-uid",

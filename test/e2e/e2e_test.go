@@ -662,6 +662,27 @@ spec:
 				takenOverPods,
 			)
 
+			By("forcing a native rollout restart through the plugin")
+			output, err = utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"rollout",
+				"restart",
+				"deployment/"+workload,
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).
+				To(Equal("deployment.apps/" + workload + " restarted"))
+			eventuallyRestartToken("deployment.apps", workload)
+			restartedNativePods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+				handedOffPods,
+			)
+			expectReplicaSetOwnersReplaced(handedOffPods, restartedNativePods)
+
 			By("recovering the incomplete workload through the plugin")
 			output, err = utils.Run(exec.Command(
 				"kubectl",
@@ -816,12 +837,29 @@ spec:
 				To(Equal(initialReplicaSet.UID),
 					"best-effort fallback unexpectedly created another ReplicaSet")
 
-			By("triggering redeploy with the standard kubectl restart annotation")
-			Expect(kubectlRestartAnnotation(workload)).To(Succeed())
+			By("forcing a Churnless rollout restart through the plugin")
+			output, err := utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"rollout",
+				"restart",
+				"deployment.churnless.io/"+workload,
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(output)).
+				To(Equal("deployment.churnless.io/" + workload + " restarted"))
+			eventuallyRestartToken("deployment.churnless.io", workload)
 			eventuallyOwnedReplicaSetCount(workload, 2)
 			expectedPod.excludedUID = fallback.UID
 			restarted := eventuallyMutablePod(expectedPod)
+			Expect(restarted.Name).NotTo(Equal(fallback.Name))
 			Expect(restarted.UID).NotTo(Equal(fallback.UID))
+			Expect(restarted.Status.PodIP).NotTo(BeEmpty())
+			previousOwner := metav1.GetControllerOf(&fallback)
+			currentOwner := metav1.GetControllerOf(&restarted)
+			Expect(previousOwner).NotTo(BeNil())
+			Expect(currentOwner).NotTo(BeNil())
+			Expect(currentOwner.UID).NotTo(Equal(previousOwner.UID))
 
 			By("changing an immutable container field")
 			Expect(patchImmutableField(workload, image)).To(Succeed())
@@ -963,6 +1001,7 @@ type podIdentity struct {
 	UID                 string
 	IP                  string
 	OwnerReplicaSetName string
+	OwnerReplicaSetUID  string
 }
 
 type policyPodSnapshot struct {
@@ -1089,6 +1128,7 @@ func eventuallyOwnedDeploymentPods(
 	workload string,
 	count int,
 	image, ownerAPIVersion string,
+	excluded ...map[string]podIdentity,
 ) map[string]podIdentity {
 	var result map[string]podIdentity
 	Eventually(func(g Gomega) {
@@ -1132,9 +1172,13 @@ func eventuallyOwnedDeploymentPods(
 				UID:                 string(pod.UID),
 				IP:                  pod.Status.PodIP,
 				OwnerReplicaSetName: owner.Name,
+				OwnerReplicaSetUID:  string(owner.UID),
 			}
 		}
 		g.Expect(current).To(HaveLen(count))
+		for _, identities := range excluded {
+			g.Expect(retainedIdentities(identities, current)).To(BeZero())
+		}
 		result = current
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	return result
@@ -1199,6 +1243,18 @@ func expectPodIdentityRetained(
 		Expect(ok).To(BeTrue(), "Pod %s was replaced", name)
 		Expect(current.UID).To(Equal(previous.UID), "Pod %s UID changed", name)
 		Expect(current.IP).To(Equal(previous.IP), "Pod %s IP changed", name)
+	}
+}
+
+func expectReplicaSetOwnersReplaced(
+	before, after map[string]podIdentity,
+) {
+	previous := make(map[string]struct{}, len(before))
+	for _, pod := range before {
+		previous[pod.OwnerReplicaSetUID] = struct{}{}
+	}
+	for _, pod := range after {
+		Expect(previous).NotTo(HaveKey(pod.OwnerReplicaSetUID))
 	}
 }
 
@@ -1507,16 +1563,19 @@ func patchMutableResources(
 	return err
 }
 
-func kubectlRestartAnnotation(workload string) error {
-	cmd := exec.Command(
-		"kubectl",
-		"annotate",
-		"deployment.churnless.io/"+workload,
-		"kubectl.kubernetes.io/restartedAt="+time.Now().UTC().Format(time.RFC3339Nano),
-		"--overwrite",
-	)
-	_, err := utils.Run(cmd)
-	return err
+func eventuallyRestartToken(resource, workload string) {
+	Eventually(func(g Gomega) {
+		output, err := utils.Run(exec.Command(
+			"kubectl",
+			"get",
+			resource+"/"+workload,
+			"-o",
+			"jsonpath={.spec.template.metadata.annotations.kubectl\\.kubernetes\\.io/restartedAt}",
+		))
+		g.Expect(err).NotTo(HaveOccurred())
+		_, err = time.Parse(time.RFC3339Nano, output)
+		g.Expect(err).NotTo(HaveOccurred())
+	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
 }
 
 func patchImmutableField(workload, image string) error {

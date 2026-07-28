@@ -212,23 +212,23 @@ revisions.
 ### Explicit redeploy
 
 A redeploy deliberately salts the structural revision even when the Pod
-template is otherwise unchanged. Churnless recognizes Kubernetes' standard
-restart annotation as a workload-level redeploy token:
+template is otherwise unchanged. The kubectl plugin gives native and
+Churnless Deployments one restart surface:
 
 ```sh
-kubectl annotate deployment.churnless.io/web \
-  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+kubectl churnless rollout restart deployment/web
 ```
 
-Native `kubectl rollout restart` writes the same key into a built-in
-Deployment's Pod template, and Churnless recognizes that placement too.
-However, the kubectl subcommand's compiled-in scheme rejects custom Deployment
-GVKs before sending a request, so the literal
-`kubectl rollout restart deployment.churnless.io/web` command cannot operate on
-the CRD. The generic `kubectl annotate` command above does not have that client
-limitation.
+The plugin resolves exactly one GVK, rejects an ambiguous same-name pair, and
+writes `kubectl.kubernetes.io/restartedAt` into the Pod template using a UTC
+RFC3339 token. Explicit `deployment.apps/NAME` and
+`deployment.churnless.io/NAME` forms bypass generic resolution. A paused
+Deployment is rejected because the requested restart could not progress.
+Success means the API accepted the new token; the command does not wait for
+readiness.
 
-Existing automation can alternatively set the Churnless-specific alias:
+Existing automation can set the same standard Pod-template annotation
+directly. Churnless also retains its workload-level alias:
 
 ```sh
 kubectl annotate deployment.churnless.io/web \
@@ -437,8 +437,8 @@ current `v1alpha1` implementation still has known gaps:
   Kubernetes library; it cannot discover different feature-gate settings or
   unrelated admission plugins configured on the hosting API server.
 - Built-in `kubectl rollout` subcommands use a compiled-in typed scheme and
-  cannot operate directly on the Churnless CRD. Use the documented standard
-  restart annotation with generic `kubectl annotate`.
+  cannot operate directly on the Churnless CRD. Use
+  `kubectl churnless rollout restart`.
 - Image revisions reuse one ReplicaSet, so they are not separate ReplicaSet
   history entries.
 - Progress-deadline enforcement, revision-history cleanup, hash-collision
@@ -464,7 +464,8 @@ The acceptance suite must continue to verify:
 - Best-effort CPU/memory changes either retain Pod identity through `resize` or
   converge by controlled replacement when resize is rejected.
 - Structural changes create a different ReplicaSet.
-- `kubectl.kubernetes.io/restartedAt` and `churnless.io/redeploy-at` create a
+- `kubectl churnless rollout restart` resolves native and Churnless
+  Deployments, and its `kubectl.kubernetes.io/restartedAt` token creates a
   different ReplicaSet and new Pods.
 - RollingUpdate stays within its availability and surge fenceposts, and
   Recreate never runs old and new revisions at the same time.

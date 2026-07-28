@@ -150,15 +150,13 @@ rollout availability budget.
 Explicitly replace every Pod even when the template is otherwise unchanged:
 
 ```sh
-kubectl churnless rollout restart deployment/deployment-sample
+kubectl annotate deployment.churnless.io/deployment-sample \
+  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
 ```
 
-The plugin resolves whether the name belongs to a native or Churnless
-Deployment, writes Kubernetes' standard restart annotation to its Pod
-template, and prints the resolved GVK. Use an explicit resource such as
-`deployment.apps/web` or `deployment.churnless.io/web` if both GVKs exist.
-The command records the restart request; it does not wait for rollout
-completion.
+The built-in `kubectl rollout restart` command cannot decode custom Deployment
+GVKs. Churnless accepts its standard annotation key through generic
+`kubectl annotate`; `churnless.io/redeploy-at` remains an equivalent alias.
 
 Clean up:
 
@@ -196,15 +194,16 @@ Build, install, and verify the kubectl plugin from a checkout:
 
 ```sh
 make install-plugin
+# If prompted, run the printed PATH export first.
 kubectl churnless --help
 ```
 
-The install target prints the exact `PATH` export when Go's bin directory is
-not already discoverable by kubectl. It does not edit shell startup files.
+If Go's bin directory is not on `PATH`, the install target prints the exact
+export to run. It does not edit shell startup files.
 
 Before starting, wait for the native Deployment to finish its rollout and
-pause any GitOps or other automation that would recreate the deleted source
-GVK or revert dependent references. Optionally record current Pod identity:
+pause automation that could recreate the source GVK or revert dependent
+references. Optionally record current Pod identity:
 
 ```sh
 kubectl rollout status deployment.apps/web
@@ -212,52 +211,34 @@ kubectl get pods -l app=web \
   -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP'
 ```
 
-Move the workload to Churnless:
+Move the workload to Churnless, then return it to native Kubernetes when
+needed:
 
 ```sh
 kubectl churnless takeover deployment/web
-```
-
-The command uses the current kubeconfig context and namespace plus the caller's
-Kubernetes permissions. It creates `deployment.churnless.io/web`, drives the
-resumable transfer engine directly, waits for completion, and reports phase
-changes. Transfer checkpoints live on the Kubernetes objects, so a timeout or
-interruption does not roll state back; rerun the same command to resume.
-The caller therefore needs read/write access to both workload GVKs, their
-ReplicaSets and Pods, plus any supported autoscaler references being retargeted.
-
-Return to native Kubernetes:
-
-```sh
 kubectl churnless handoff deployment/web
 ```
 
-`handoff` remains usable when the complete Churnless manager and admission
-server are unavailable. Metadata-only bookkeeping bypasses the unavailable
-webhooks, the plugin drives the operation, and Kubernetes' native Deployment
-and ReplicaSet controllers warm the target. Takeover still requires a healthy
-Churnless manager because the Churnless target must become operational.
+Both commands use the current kubeconfig context and namespace, report
+progress, and wait for completion. Checkpoints live in Kubernetes, so rerun the
+same command after an interruption or run the opposite command to reverse an
+in-progress transfer.
 
-When the Churnless rollout is healthy, handoff retains ready Pod identity when
-Kubernetes permits it. If the Churnless rollout is unhealthy, recovery does
-not wait for it: the plugin creates a native Deployment, Kubernetes warms its
-native ReplicaSet to the desired Pod count, the plugin retargets supported
-dependents, and then it removes the Churnless hierarchy. Recovery prioritizes
-native ownership over Pod identity, and the native Deployment may remain
-unhealthy until its desired spec is fixed. A handoff that starts healthy also
-switches to recovery if the Churnless source becomes incomplete before
-cutover.
+Takeover requires a complete native rollout and a healthy Churnless manager.
+Healthy handoff preserves ready Pod name, UID, and IP when Kubernetes permits
+it and remains available while the Churnless manager and admission server are
+down. An incomplete Churnless rollout instead uses recovery handoff: native
+controllers warm the destination and the old Pods are replaced without waiting
+for Churnless to recover.
 
-Run the opposite plugin command to reverse an in-progress operation. While the
-source still exists, the engine cancels safely and restores dependent
-references. After source deletion begins, it finishes the ownership cutover
-and then starts the reverse transfer. Raw `churnless.io/controller`
-annotations are durable engine state, not a public trigger; changing one
-without running the plugin does not advance a transfer.
+The caller needs read/write access to both Deployment GVKs, their ReplicaSets
+and Pods, and supported autoscaler references. During a transfer, keep the
+source spec unchanged and do not create the same-name target GVK manually.
+Temporary target Pods can briefly increase Pod and resource counts.
 
-During a transfer, keep the source spec unchanged and do not create the
-same-name target GVK manually. Transfers never start from an already-deleting
-source. Temporary target Pods can briefly increase Pod and resource counts.
+The engine retargets HorizontalPodAutoscaler, VerticalPodAutoscaler, and KEDA
+ScaledObject references. Selector-based Services and PodDisruptionBudgets keep
+matching the same labels; review other custom workload references separately.
 
 Inspect current objects with:
 
@@ -265,14 +246,9 @@ Inspect current objects with:
 kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
 ```
 
-This migration currently supports Deployments only. Before cutover, the
-plugin's transfer engine automatically retargets HorizontalPodAutoscaler,
-VerticalPodAutoscaler, and KEDA ScaledObject references to the new Deployment
-GVK. Services, PodDisruptionBudgets, and other selector-based resources keep
-matching the same Pod labels. Custom resources with other explicit workload
-references must still be reviewed separately. See
-[DESIGN.md](DESIGN.md#takeover-and-handoff) for the ownership protocol and
-failure boundary.
+Migration currently supports Deployments only. See
+[DESIGN.md](DESIGN.md#takeover-and-handoff) for its ownership protocol,
+cancellation semantics, persisted state, and failure boundaries.
 
 ## Design
 

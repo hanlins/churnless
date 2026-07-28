@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -34,9 +35,9 @@ type fakeMigrationEngine struct {
 	progress             []MigrationProgress
 	steps                int
 	requestErr           error
-	inspectErr           error
-	inspectErrorAt       int
-	inspectCalls         int
+	advanceErr           error
+	advanceErrorAt       int
+	advanceCalls         int
 	stepResult           MigrationStep
 	stepErr              error
 }
@@ -51,213 +52,211 @@ func (f *fakeMigrationEngine) RequestMigration(
 	return f.requestErr
 }
 
-func (f *fakeMigrationEngine) InspectMigration(
+func (f *fakeMigrationEngine) AdvanceMigration(
 	_ context.Context,
 	_ types.NamespacedName,
 	_ MigrationDestination,
-) (MigrationProgress, error) {
-	f.inspectCalls++
-	if f.inspectErr != nil && f.inspectCalls == f.inspectErrorAt {
-		return MigrationProgress{}, f.inspectErr
+) (MigrationProgress, MigrationStep, error) {
+	f.advanceCalls++
+	if f.advanceErr != nil && f.advanceCalls == f.advanceErrorAt {
+		return MigrationProgress{}, 0, f.advanceErr
 	}
 	index := min(f.steps, len(f.progress)-1)
-	return f.progress[index], nil
-}
-
-func (f *fakeMigrationEngine) StepMigration(
-	_ context.Context,
-	_ types.NamespacedName,
-) (MigrationStep, error) {
+	progress := f.progress[index]
+	if progress.Complete || progress.Superseded {
+		return progress, 0, nil
+	}
 	f.steps++
-	return f.stepResult, f.stepErr
+	return progress, f.stepResult, f.stepErr
 }
 
-func TestMigrationDriverRunsEngineToCompletion(t *testing.T) {
+func TestMigrationDriverTransfer(t *testing.T) {
 	t.Parallel()
 
 	key := types.NamespacedName{Namespace: "team", Name: migrationDriverTestWorkload}
-	engine := &fakeMigrationEngine{progress: []MigrationProgress{
-		{
-			Destination:       MigrationDestinationNative,
-			CurrentController: MigrationDestinationChurnless,
-			Message:           "waiting to start handoff to native Kubernetes",
-		},
-		{
-			Destination:       MigrationDestinationNative,
-			CurrentController: MigrationDestinationChurnless,
-			Phase:             migrationPhaseWarming,
-			Mode:              migrationModePreserve,
-			Message:           "preserve handoff in warming phase",
-		},
-		{
-			Destination:       MigrationDestinationNative,
-			CurrentController: MigrationDestinationNative,
-			Complete:          true,
-			Message:           "handoff complete; native Kubernetes is authoritative",
-		},
-	}}
-	var observed []MigrationProgress
-	driver := &MigrationDriver{
-		Engine:  engine,
-		Observe: func(progress MigrationProgress) { observed = append(observed, progress) },
+	nativePending := MigrationProgress{
+		Destination:       MigrationDestinationNative,
+		CurrentController: MigrationDestinationChurnless,
+		Message:           "waiting to start handoff",
 	}
-
-	if err := driver.Transfer(
-		context.Background(),
-		key,
-		MigrationDestinationNative,
-	); err != nil {
-		t.Fatal(err)
+	nativeComplete := MigrationProgress{
+		Destination:       MigrationDestinationNative,
+		CurrentController: MigrationDestinationNative,
+		Complete:          true,
+		Message:           "handoff complete; native Kubernetes is authoritative",
 	}
-	if engine.requestedKey != key {
-		t.Fatalf("requested key = %v, want %v", engine.requestedKey, key)
+	interrupted := []string{
+		"cluster state may have advanced",
+		"run the same command to resume",
 	}
-	if engine.requestedDestination != MigrationDestinationNative {
-		t.Fatalf("requested destination = %q", engine.requestedDestination)
-	}
-	if engine.steps != 2 {
-		t.Fatalf("engine steps = %d, want 2", engine.steps)
-	}
-	if len(observed) != 3 || !observed[len(observed)-1].Complete {
-		t.Fatalf("observed progress = %#v", observed)
-	}
-}
-
-func TestMigrationDriverImmediatelyRequeuesRequestedSteps(t *testing.T) {
-	t.Parallel()
-
-	engine := &fakeMigrationEngine{
-		progress: []MigrationProgress{
-			{
-				Destination:       MigrationDestinationNative,
-				CurrentController: MigrationDestinationChurnless,
-				Message:           "waiting to start handoff",
-			},
-			{
-				Destination:       MigrationDestinationNative,
-				CurrentController: MigrationDestinationChurnless,
-				Phase:             migrationPhaseWarming,
-				Message:           "warming native target",
-			},
-			{
-				Destination:       MigrationDestinationNative,
-				CurrentController: MigrationDestinationNative,
-				Complete:          true,
-				Message:           "handoff complete",
-			},
-		},
-		stepResult: MigrationStep{Requeue: true},
-	}
-	driver := &MigrationDriver{
-		Engine:       engine,
-		PollInterval: time.Hour,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	if err := driver.Transfer(
-		ctx,
-		types.NamespacedName{
-			Namespace: migrationTestNamespace,
-			Name:      migrationDriverTestWorkload,
-		},
-		MigrationDestinationNative,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if engine.steps != 2 {
-		t.Fatalf("engine steps = %d, want 2", engine.steps)
-	}
-}
-
-func TestMigrationStepSchedule(t *testing.T) {
-	t.Parallel()
-
-	const (
-		defaultDelay = 5 * time.Second
-		retryAfter   = 2 * time.Second
-	)
 	tests := []struct {
 		name          string
-		step          MigrationStep
-		stepErr       error
-		wantImmediate bool
-		wantDelay     time.Duration
+		engine        *fakeMigrationEngine
+		destination   MigrationDestination
+		pollInterval  time.Duration
+		timeout       time.Duration
+		wantSteps     int
+		wantObserved  int
+		errorContains []string
 	}{
 		{
-			name:          "immediate requeue",
-			step:          MigrationStep{Requeue: true},
-			wantImmediate: true,
+			name: "runs to completion and reports progress",
+			engine: &fakeMigrationEngine{progress: []MigrationProgress{
+				nativePending,
+				{
+					Destination:       MigrationDestinationNative,
+					CurrentController: MigrationDestinationChurnless,
+					Mode:              migrationModePreserve,
+					Message:           "preserve handoff in progress",
+				},
+				nativeComplete,
+			}},
+			destination:  MigrationDestinationNative,
+			wantSteps:    2,
+			wantObserved: 3,
 		},
 		{
-			name:      "delayed retry",
-			step:      MigrationStep{RetryAfter: retryAfter},
-			wantDelay: retryAfter,
-		},
-		{
-			name: "delay takes precedence",
-			step: MigrationStep{
-				Requeue:    true,
-				RetryAfter: retryAfter,
+			name: "immediately drives requested requeues",
+			engine: &fakeMigrationEngine{
+				progress:   []MigrationProgress{nativePending, nativePending, nativeComplete},
+				stepResult: 0,
 			},
-			wantDelay: retryAfter,
+			destination:  MigrationDestinationNative,
+			pollInterval: time.Hour,
+			timeout:      500 * time.Millisecond,
+			wantSteps:    2,
 		},
 		{
-			name:          "error ignores step scheduling",
-			step:          MigrationStep{Requeue: true},
-			stepErr:       context.DeadlineExceeded,
-			wantImmediate: false,
-			wantDelay:     defaultDelay,
+			name: "is idempotent at the destination",
+			engine: &fakeMigrationEngine{progress: []MigrationProgress{{
+				Destination:       MigrationDestinationChurnless,
+				CurrentController: MigrationDestinationChurnless,
+				Complete:          true,
+				Message:           "takeover complete; Churnless is authoritative",
+			}}},
+			destination: MigrationDestinationChurnless,
 		},
 		{
-			name:      "default poll",
-			wantDelay: defaultDelay,
+			name: "returns a terminal advance error",
+			engine: &fakeMigrationEngine{
+				progress: []MigrationProgress{nativePending},
+				stepErr:  errors.New("source Deployment is deleting"),
+			},
+			destination:   MigrationDestinationNative,
+			pollInterval:  time.Hour,
+			wantSteps:     1,
+			errorContains: []string{"advance migration", "source Deployment is deleting"},
+		},
+		{
+			name: "explains request interruption",
+			engine: &fakeMigrationEngine{
+				requestErr: context.DeadlineExceeded,
+			},
+			destination:   MigrationDestinationNative,
+			errorContains: interrupted,
+		},
+		{
+			name: "explains advance interruption before progress",
+			engine: &fakeMigrationEngine{
+				progress:       []MigrationProgress{nativePending},
+				advanceErr:     context.DeadlineExceeded,
+				advanceErrorAt: 1,
+			},
+			destination:   MigrationDestinationNative,
+			errorContains: interrupted,
+		},
+		{
+			name: "retries a transient initial advance",
+			engine: &fakeMigrationEngine{
+				progress:       []MigrationProgress{nativePending, nativeComplete},
+				advanceErr:     apierrors.NewTooManyRequests("try again", 0),
+				advanceErrorAt: 1,
+			},
+			destination:  MigrationDestinationNative,
+			pollInterval: time.Millisecond,
+			wantSteps:    1,
+		},
+		{
+			name: "honors a positive advance delay",
+			engine: &fakeMigrationEngine{
+				progress:   []MigrationProgress{nativePending, nativeComplete},
+				stepResult: MigrationStep(time.Hour),
+			},
+			destination:   MigrationDestinationNative,
+			timeout:       50 * time.Millisecond,
+			wantSteps:     1,
+			errorContains: interrupted,
+		},
+		{
+			name: "explains step interruption",
+			engine: &fakeMigrationEngine{
+				progress: []MigrationProgress{nativePending},
+				stepErr:  context.DeadlineExceeded,
+			},
+			destination:   MigrationDestinationNative,
+			wantSteps:     1,
+			errorContains: interrupted,
+		},
+		{
+			name: "stops when superseded",
+			engine: &fakeMigrationEngine{progress: []MigrationProgress{
+				nativePending,
+				{
+					Destination:         MigrationDestinationNative,
+					RequestedController: MigrationDestinationChurnless,
+					CurrentController:   MigrationDestinationChurnless,
+					Superseded:          true,
+					Message:             "request to native was superseded",
+				},
+			}},
+			destination:   MigrationDestinationNative,
+			wantSteps:     1,
+			errorContains: []string{"superseded"},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			immediate, delay := migrationStepSchedule(
-				test.step,
-				test.stepErr,
-				defaultDelay,
-			)
-			if immediate != test.wantImmediate || delay != test.wantDelay {
+			ctx := context.Background()
+			if test.timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, test.timeout)
+				defer cancel()
+			}
+			var observed []MigrationProgress
+			err := (&MigrationDriver{
+				Engine:       test.engine,
+				PollInterval: test.pollInterval,
+				Observe:      func(progress MigrationProgress) { observed = append(observed, progress) },
+			}).Transfer(ctx, key, test.destination)
+
+			if len(test.errorContains) == 0 && err != nil {
+				t.Fatal(err)
+			}
+			for _, text := range test.errorContains {
+				if err == nil || !strings.Contains(err.Error(), text) {
+					t.Fatalf("error = %v, want substring %q", err, text)
+				}
+			}
+			if test.engine.requestedKey != key ||
+				test.engine.requestedDestination != test.destination {
 				t.Fatalf(
-					"schedule = (%t, %s), want (%t, %s)",
-					immediate,
-					delay,
-					test.wantImmediate,
-					test.wantDelay,
+					"request = %v to %q, want %v to %q",
+					test.engine.requestedKey,
+					test.engine.requestedDestination,
+					key,
+					test.destination,
 				)
 			}
+			if test.engine.steps != test.wantSteps {
+				t.Fatalf("engine steps = %d, want %d", test.engine.steps, test.wantSteps)
+			}
+			if test.wantObserved > 0 &&
+				(len(observed) != test.wantObserved || !observed[len(observed)-1].Complete) {
+				t.Fatalf("observed progress = %#v", observed)
+			}
 		})
-	}
-}
-
-func TestMigrationDriverIsIdempotentAtDestination(t *testing.T) {
-	t.Parallel()
-
-	engine := &fakeMigrationEngine{progress: []MigrationProgress{{
-		Destination:       MigrationDestinationChurnless,
-		CurrentController: MigrationDestinationChurnless,
-		Complete:          true,
-		Message:           "takeover complete; Churnless is authoritative",
-	}}}
-	driver := &MigrationDriver{Engine: engine}
-	if err := driver.Transfer(
-		context.Background(),
-		types.NamespacedName{
-			Namespace: migrationTestNamespace,
-			Name:      migrationDriverTestWorkload,
-		},
-		MigrationDestinationChurnless,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if engine.steps != 0 {
-		t.Fatalf("engine steps = %d, want 0", engine.steps)
 	}
 }
 
@@ -285,128 +284,5 @@ func TestMigrationDriverTimeoutExplainsResume(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "run the same command to resume") {
 		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestMigrationDriverReturnsTerminalStepErrorWithoutPolling(t *testing.T) {
-	t.Parallel()
-
-	engine := &fakeMigrationEngine{
-		progress: []MigrationProgress{{
-			Destination:       MigrationDestinationNative,
-			CurrentController: MigrationDestinationChurnless,
-			Message:           "starting handoff",
-		}},
-		stepErr: errors.New("source Deployment is deleting"),
-	}
-	driver := &MigrationDriver{
-		Engine:       engine,
-		PollInterval: time.Hour,
-	}
-	err := driver.Transfer(
-		context.Background(),
-		types.NamespacedName{
-			Namespace: migrationTestNamespace,
-			Name:      migrationDriverTestWorkload,
-		},
-		MigrationDestinationNative,
-	)
-	if err == nil ||
-		!strings.Contains(err.Error(), "drive migration") ||
-		!strings.Contains(err.Error(), "source Deployment is deleting") {
-		t.Fatalf("error = %v", err)
-	}
-	if engine.steps != 1 {
-		t.Fatalf("engine steps = %d, want 1", engine.steps)
-	}
-}
-
-func TestMigrationDriverInterruptionAlwaysExplainsResume(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		engine *fakeMigrationEngine
-	}{
-		{
-			name: "request",
-			engine: &fakeMigrationEngine{
-				requestErr: context.DeadlineExceeded,
-			},
-		},
-		{
-			name: "inspect",
-			engine: &fakeMigrationEngine{
-				progress:       []MigrationProgress{{Message: "starting handoff"}},
-				inspectErr:     context.DeadlineExceeded,
-				inspectErrorAt: 1,
-			},
-		},
-		{
-			name: "step",
-			engine: &fakeMigrationEngine{
-				progress: []MigrationProgress{{
-					Destination:       MigrationDestinationNative,
-					CurrentController: MigrationDestinationChurnless,
-					Message:           "warming native target",
-				}},
-				stepErr: context.DeadlineExceeded,
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			driver := &MigrationDriver{Engine: tt.engine}
-			err := driver.Transfer(
-				context.Background(),
-				types.NamespacedName{
-					Namespace: migrationTestNamespace,
-					Name:      migrationDriverTestWorkload,
-				},
-				MigrationDestinationNative,
-			)
-			if err == nil ||
-				!strings.Contains(err.Error(), "cluster state may have advanced") ||
-				!strings.Contains(err.Error(), "run the same command to resume") {
-				t.Fatalf("error = %v", err)
-			}
-		})
-	}
-}
-
-func TestMigrationDriverStopsWhenRequestIsSuperseded(t *testing.T) {
-	t.Parallel()
-
-	engine := &fakeMigrationEngine{progress: []MigrationProgress{
-		{
-			Destination:         MigrationDestinationNative,
-			RequestedController: MigrationDestinationNative,
-			CurrentController:   MigrationDestinationChurnless,
-			Message:             "waiting to start handoff",
-		},
-		{
-			Destination:         MigrationDestinationNative,
-			RequestedController: MigrationDestinationChurnless,
-			CurrentController:   MigrationDestinationChurnless,
-			Superseded:          true,
-			Message:             "request to native was superseded by desired controller churnless",
-		},
-	}}
-	driver := &MigrationDriver{Engine: engine}
-	err := driver.Transfer(
-		context.Background(),
-		types.NamespacedName{
-			Namespace: migrationTestNamespace,
-			Name:      migrationDriverTestWorkload,
-		},
-		MigrationDestinationNative,
-	)
-	if err == nil || !strings.Contains(err.Error(), "superseded") {
-		t.Fatalf("error = %v", err)
-	}
-	if engine.steps != 1 {
-		t.Fatalf("engine steps = %d, want 1", engine.steps)
 	}
 }

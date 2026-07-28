@@ -28,7 +28,7 @@ import (
 	"github.com/hanlins/churnless/internal/controller"
 )
 
-const commandTestWorkload = "web"
+const commandTestNamespace, commandTestWorkload = "team", "web"
 
 type fakeTransferer struct {
 	key         types.NamespacedName
@@ -37,9 +37,7 @@ type fakeTransferer struct {
 }
 
 func (f *fakeTransferer) Transfer(
-	_ context.Context,
-	key types.NamespacedName,
-	destination controller.MigrationDestination,
+	_ context.Context, key types.NamespacedName, destination controller.MigrationDestination,
 ) error {
 	f.key = key
 	f.destination = destination
@@ -49,20 +47,6 @@ func (f *fakeTransferer) Transfer(
 		Message:     "handoff complete; native Kubernetes is authoritative",
 	})
 	return nil
-}
-
-type fakeRestarter struct {
-	namespace string
-	resource  string
-}
-
-func (f *fakeRestarter) Restart(
-	_ context.Context,
-	namespace, resource string,
-) (string, error) {
-	f.namespace = namespace
-	f.resource = resource
-	return "deployment.churnless.io/" + commandTestWorkload, nil
 }
 
 func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
@@ -77,25 +61,17 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 	configFlags.Insecure = &insecure
 	runner := &fakeTransferer{}
 	command := newCommand(
-		streams,
-		configFlags,
-		func(
-			_ *rest.Config,
-			observe func(controller.MigrationProgress),
-		) (transferred, error) {
+		streams, configFlags,
+		func(_ *rest.Config, observe func(controller.MigrationProgress)) (transferred, error) {
 			runner.observe = observe
 			return runner, nil
-		},
-		func(_ *rest.Config) (restarted, error) {
-			t.Fatal("restart factory was called for handoff")
-			return nil, nil
 		},
 	)
 	command.SetArgs([]string{
 		"handoff",
 		"deployment/" + commandTestWorkload,
 		"--namespace",
-		restartTestNamespace,
+		commandTestNamespace,
 		"--timeout=0",
 	})
 
@@ -103,7 +79,7 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 		t.Fatal(err)
 	}
 	if runner.key != (types.NamespacedName{
-		Namespace: restartTestNamespace,
+		Namespace: commandTestNamespace,
 		Name:      commandTestWorkload,
 	}) {
 		t.Fatalf("key = %v", runner.key)
@@ -111,70 +87,21 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 	if runner.destination != controller.MigrationDestinationNative {
 		t.Fatalf("destination = %q", runner.destination)
 	}
-	if got := output.String(); got !=
-		"deployment/web: handoff complete; native Kubernetes is authoritative\n" {
-		t.Fatalf("output = %q", got)
-	}
-}
-
-func TestRestartCommandUsesNamespaceAndPrintsResolvedResource(t *testing.T) {
-	t.Parallel()
-
-	var output bytes.Buffer
-	streams := genericclioptions.IOStreams{Out: &output, ErrOut: &output}
-	configFlags := genericclioptions.NewConfigFlags(true)
-	server := "https://127.0.0.1"
-	insecure := true
-	configFlags.APIServer = &server
-	configFlags.Insecure = &insecure
-	restarter := &fakeRestarter{}
-	command := newCommand(
-		streams,
-		configFlags,
-		func(
-			_ *rest.Config,
-			_ func(controller.MigrationProgress),
-		) (transferred, error) {
-			t.Fatal("transfer factory was called for restart")
-			return nil, nil
-		},
-		func(_ *rest.Config) (restarted, error) {
-			return restarter, nil
-		},
-	)
-	command.SetArgs([]string{
-		"rollout",
-		"restart",
-		"deployment/" + commandTestWorkload,
-		"--namespace",
-		restartTestNamespace,
-	})
-
-	if err := command.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if restarter.namespace != restartTestNamespace {
-		t.Fatalf("namespace = %q", restarter.namespace)
-	}
-	if restarter.resource != "deployment/"+commandTestWorkload {
-		t.Fatalf("resource = %q", restarter.resource)
-	}
-	if got := output.String(); got !=
-		"deployment.churnless.io/web restarted\n" {
-		t.Fatalf("output = %q", got)
+	if got, want := output.String(),
+		"deployment/web: handoff complete; native Kubernetes is authoritative\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
 
 func TestDeploymentName(t *testing.T) {
 	t.Parallel()
 
-	for _, resource := range []string{
-		"deployment/" + commandTestWorkload,
-		"deploy/" + commandTestWorkload,
-		"deployment.apps/" + commandTestWorkload,
-		"deployment.churnless.io/" + commandTestWorkload,
-		"cdeploy/" + commandTestWorkload,
+	for _, kind := range []string{
+		"deployment", "deployments", "deploy",
+		"deployment.apps", "deployments.apps",
+		"deployment.churnless.io", "deployments.churnless.io", "cdeploy",
 	} {
+		resource := kind + "/" + commandTestWorkload
 		name, err := deploymentName(resource)
 		if err != nil {
 			t.Fatalf("deploymentName(%q): %v", resource, err)
@@ -184,10 +111,7 @@ func TestDeploymentName(t *testing.T) {
 		}
 	}
 	for _, resource := range []string{
-		commandTestWorkload,
-		"pod/" + commandTestWorkload,
-		"deployment/",
-		"deployment/a/b",
+		commandTestWorkload, "pod/" + commandTestWorkload, "deployment/", "deployment/a/b",
 	} {
 		if _, err := deploymentName(resource); err == nil {
 			t.Fatalf("deploymentName(%q) succeeded", resource)

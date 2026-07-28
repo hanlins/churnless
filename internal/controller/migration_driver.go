@@ -45,32 +45,26 @@ type MigrationProgress struct {
 	Destination         MigrationDestination
 	RequestedController MigrationDestination
 	CurrentController   MigrationDestination
-	Phase               string
 	Mode                string
 	Complete            bool
 	Superseded          bool
 	Message             string
 }
 
-// MigrationStep is the controller-neutral scheduling result of one idempotent
-// migration step. RetryAfter takes precedence over Requeue, and scheduling is
-// ignored when the step returns an error.
-type MigrationStep struct {
-	Requeue    bool
-	RetryAfter time.Duration
-}
+// MigrationStep is how long the synchronous driver should wait before the
+// next idempotent step. Zero drives the next step immediately.
+type MigrationStep time.Duration
 
 // MigrationEngine is the reusable transfer surface driven by kubectl-churnless.
-// A future controller can adapt this same step API without owning transfer
-// semantics.
+// RequestMigration records intent once; AdvanceMigration observes that intent
+// before running one idempotent step.
 type MigrationEngine interface {
 	RequestMigration(context.Context, types.NamespacedName, MigrationDestination) error
-	InspectMigration(
+	AdvanceMigration(
 		context.Context,
 		types.NamespacedName,
 		MigrationDestination,
-	) (MigrationProgress, error)
-	StepMigration(context.Context, types.NamespacedName) (MigrationStep, error)
+	) (MigrationProgress, MigrationStep, error)
 }
 
 // MigrationDriver synchronously drives an idempotent migration engine.
@@ -116,77 +110,43 @@ func (d *MigrationDriver) Transfer(
 		}
 	}
 
-	progress, err := d.Engine.InspectMigration(ctx, key, destination)
-	if err != nil {
-		return migrationOperationError(ctx, lastProgress, "inspect migration", err)
-	}
-	d.observe(progress)
-	if progress.Superseded {
-		return migrationSupersededError(progress)
-	}
-	if progress.Complete {
-		return nil
-	}
-
-	lastProgress = progress
 	for {
-		step, stepErr := d.Engine.StepMigration(ctx, key)
-		if stepErr != nil && !retryableMigrationError(stepErr) {
-			return migrationOperationError(
-				ctx,
-				lastProgress,
-				"drive migration",
-				stepErr,
-			)
+		progress, step, err := d.Engine.AdvanceMigration(ctx, key, destination)
+		if progress.Destination != "" && progress != lastProgress {
+			d.observe(progress)
+			lastProgress = progress
 		}
-
-		progress, err = d.Engine.InspectMigration(ctx, key, destination)
 		if err != nil {
 			if !retryableMigrationError(err) {
 				return migrationOperationError(
 					ctx,
 					lastProgress,
-					"inspect migration",
+					"advance migration",
 					err,
 				)
 			}
-		} else {
-			if progress != lastProgress {
-				d.observe(progress)
-				lastProgress = progress
+			if err := waitForMigrationRetry(ctx, pollInterval); err != nil {
+				return migrationOperationError(ctx, lastProgress, "advance migration", err)
 			}
-			if progress.Superseded {
-				return migrationSupersededError(progress)
-			}
-			if progress.Complete {
-				return nil
-			}
+			continue
+		}
+		if progress.Superseded {
+			return migrationSupersededError(progress)
+		}
+		if progress.Complete {
+			return nil
 		}
 
-		immediate, delay := migrationStepSchedule(step, stepErr, pollInterval)
-		if immediate {
+		delay := time.Duration(step)
+		if delay <= 0 {
+			if err := ctx.Err(); err != nil {
+				return migrationOperationError(ctx, lastProgress, "advance migration", err)
+			}
 			continue
 		}
 		if err := waitForMigrationRetry(ctx, delay); err != nil {
 			return migrationOperationError(ctx, lastProgress, "wait for migration", err)
 		}
-	}
-}
-
-func migrationStepSchedule(
-	step MigrationStep,
-	stepErr error,
-	defaultDelay time.Duration,
-) (immediate bool, delay time.Duration) {
-	switch {
-	case stepErr != nil:
-		return false, defaultDelay
-	case step.RetryAfter > 0:
-		return false, step.RetryAfter
-	case step.Requeue:
-		return true, 0
-	default:
-		return false, defaultDelay
 	}
 }
 
@@ -209,22 +169,14 @@ func (r *DeploymentMigrationEngine) RequestMigration(
 
 	const attempts = 2
 	for attempt := range attempts {
-		native, err := r.getNativeDeployment(ctx, key)
-		if err != nil {
-			return err
-		}
-		churnless, err := r.getChurnlessDeployment(ctx, key)
+		pair, err := r.loadMigrationPair(ctx, key)
 		if err != nil {
 			return err
 		}
 
-		requestTarget, err := migrationRequestTarget(native, churnless)
-		if err != nil {
-			return err
-		}
 		err = r.setAnnotation(
 			ctx,
-			requestTarget,
+			pair.requestTarget(),
 			controllerAnnotation,
 			string(destination),
 		)
@@ -235,98 +187,69 @@ func (r *DeploymentMigrationEngine) RequestMigration(
 	return nil
 }
 
-func migrationRequestTarget(
-	native *appsv1.Deployment,
-	churnless *appsv1alpha1.Deployment,
-) (client.Object, error) {
-	switch {
-	case churnless != nil &&
-		churnless.GetAnnotations()[migrationSourceAnnotation] == nativeDeploymentSource:
-		if native != nil {
-			return native, nil
-		}
-		return churnless, nil
-	case native != nil &&
-		native.GetAnnotations()[migrationSourceAnnotation] == churnlessDeploymentSource:
-		if churnless != nil {
-			return churnless, nil
-		}
-		return native, nil
-	case native != nil && churnless != nil:
-		return nil, fmt.Errorf(
-			"same-name native and Churnless Deployments exist without valid migration state",
-		)
-	case native != nil:
-		return native, nil
-	case churnless != nil:
-		return churnless, nil
-	default:
-		return nil, fmt.Errorf("deployment does not exist")
-	}
-}
-
-// InspectMigration reports persisted migration state without mutating it.
-func (r *DeploymentMigrationEngine) InspectMigration(
+// AdvanceMigration reports current progress and, unless the request is already
+// complete or superseded, advances one idempotent transfer step.
+func (r *DeploymentMigrationEngine) AdvanceMigration(
 	ctx context.Context,
 	key types.NamespacedName,
 	destination MigrationDestination,
-) (MigrationProgress, error) {
+) (MigrationProgress, MigrationStep, error) {
 	if err := validateMigrationDestination(destination); err != nil {
-		return MigrationProgress{}, err
+		return MigrationProgress{}, 0, err
 	}
-	native, err := r.getNativeDeployment(ctx, key)
+	pair, err := r.loadMigrationPair(ctx, key)
 	if err != nil {
-		return MigrationProgress{}, err
-	}
-	churnless, err := r.getChurnlessDeployment(ctx, key)
-	if err != nil {
-		return MigrationProgress{}, err
+		return MigrationProgress{}, 0, err
 	}
 
+	progress, err := migrationProgressForPair(pair, destination)
+	if err != nil {
+		return MigrationProgress{}, 0, err
+	}
+	if progress.Complete || progress.Superseded {
+		return progress, 0, nil
+	}
+	step, err := r.advanceMigrationPair(ctx, pair)
+	return progress, step, err
+}
+
+func migrationProgressForPair(
+	pair migrationPair,
+	destination MigrationDestination,
+) (MigrationProgress, error) {
 	progress := MigrationProgress{Destination: destination}
-	switch {
-	case churnless != nil &&
-		churnless.Annotations[migrationSourceAnnotation] == nativeDeploymentSource:
-		if err := validateMigrationTarget(churnless, nativeDeploymentSource, false); err != nil {
+	switch pair.destination {
+	case MigrationDestinationChurnless:
+		if err := validateMigrationTarget(pair.churnless, false); err != nil {
 			return MigrationProgress{}, err
 		}
 		progress.CurrentController = MigrationDestinationNative
-		if native == nil || !native.DeletionTimestamp.IsZero() {
+		if pair.native == nil || !pair.native.DeletionTimestamp.IsZero() {
 			progress.CurrentController = MigrationDestinationChurnless
 		}
-		progress.Phase = churnless.Annotations[migrationPhaseAnnotation]
-		progress.Mode = churnless.Annotations[migrationModeAnnotation]
-	case native != nil &&
-		native.Annotations[migrationSourceAnnotation] == churnlessDeploymentSource:
-		if err := validateMigrationTarget(native, churnlessDeploymentSource, true); err != nil {
+		progress.Mode = pair.churnless.Annotations[migrationModeAnnotation]
+	case MigrationDestinationNative:
+		if err := validateMigrationTarget(pair.native, true); err != nil {
 			return MigrationProgress{}, err
 		}
 		progress.CurrentController = MigrationDestinationChurnless
-		if churnless == nil || !churnless.DeletionTimestamp.IsZero() {
+		if pair.churnless == nil || !pair.churnless.DeletionTimestamp.IsZero() {
 			progress.CurrentController = MigrationDestinationNative
 		}
-		progress.Phase = native.Annotations[migrationPhaseAnnotation]
-		progress.Mode = native.Annotations[migrationModeAnnotation]
-	case native != nil && churnless != nil:
-		return MigrationProgress{}, fmt.Errorf(
-			"same-name native and Churnless Deployments exist without valid migration state",
-		)
-	case native != nil:
-		progress.CurrentController = MigrationDestinationNative
-		progress.Complete = destination == MigrationDestinationNative
-	case churnless != nil:
-		progress.CurrentController = MigrationDestinationChurnless
-		progress.Complete = destination == MigrationDestinationChurnless
-	default:
-		return MigrationProgress{}, fmt.Errorf("deployment does not exist")
+		progress.Mode = pair.native.Annotations[migrationModeAnnotation]
+	case "":
+		switch {
+		case pair.native != nil:
+			progress.CurrentController = MigrationDestinationNative
+			progress.Complete = destination == MigrationDestinationNative
+		case pair.churnless != nil:
+			progress.CurrentController = MigrationDestinationChurnless
+			progress.Complete = destination == MigrationDestinationChurnless
+		}
 	}
 
-	requestTarget, err := migrationRequestTarget(native, churnless)
-	if err != nil {
-		return MigrationProgress{}, err
-	}
 	requested := MigrationDestination(
-		requestTarget.GetAnnotations()[controllerAnnotation],
+		pair.requestTarget().GetAnnotations()[controllerAnnotation],
 	)
 	if err := validateMigrationDestination(requested); err != nil {
 		return MigrationProgress{}, err
@@ -353,7 +276,7 @@ func migrationProgressMessage(progress MigrationProgress) string {
 		}
 		return "takeover complete; Churnless is authoritative"
 	}
-	if progress.Phase == "" {
+	if progress.Mode == "" {
 		if progress.Destination == MigrationDestinationNative {
 			return "waiting to start handoff to native Kubernetes"
 		}
@@ -363,7 +286,78 @@ func migrationProgressMessage(progress MigrationProgress) string {
 	if progress.Destination == MigrationDestinationNative {
 		action = "handoff"
 	}
-	return fmt.Sprintf("%s %s in %s phase", progress.Mode, action, progress.Phase)
+	if progress.CurrentController == progress.Destination {
+		return fmt.Sprintf("finalizing %s %s", progress.Mode, action)
+	}
+	return fmt.Sprintf("%s %s in progress", progress.Mode, action)
+}
+
+// migrationPair is the single classification of the same-name native and
+// Churnless Deployments used by requests and transfer advances.
+type migrationPair struct {
+	native      *appsv1.Deployment
+	churnless   *appsv1alpha1.Deployment
+	destination MigrationDestination
+}
+
+func (r *DeploymentMigrationEngine) loadMigrationPair(
+	ctx context.Context,
+	key types.NamespacedName,
+) (migrationPair, error) {
+	native, err := r.getNativeDeployment(ctx, key)
+	if err != nil {
+		return migrationPair{}, err
+	}
+	churnless, err := r.getChurnlessDeployment(ctx, key)
+	if err != nil {
+		return migrationPair{}, err
+	}
+
+	pair := migrationPair{native: native, churnless: churnless}
+	nativeTarget := native != nil && hasMigrationState(native)
+	churnlessTarget := churnless != nil && hasMigrationState(churnless)
+	switch {
+	case nativeTarget && churnlessTarget:
+		return migrationPair{}, fmt.Errorf(
+			"same-name native and Churnless Deployments both contain migration state",
+		)
+	case churnlessTarget:
+		pair.destination = MigrationDestinationChurnless
+	case nativeTarget:
+		pair.destination = MigrationDestinationNative
+	case native != nil && churnless != nil:
+		return migrationPair{}, fmt.Errorf(
+			"same-name native and Churnless Deployments exist without valid migration state",
+		)
+	case native == nil && churnless == nil:
+		return migrationPair{}, fmt.Errorf("deployment does not exist")
+	}
+	return pair, nil
+}
+
+func hasMigrationState(object client.Object) bool {
+	_, found := object.GetAnnotations()[migrationStateVersionAnnotation]
+	return found
+}
+
+func (p migrationPair) requestTarget() client.Object {
+	switch p.destination {
+	case MigrationDestinationChurnless:
+		if p.native != nil {
+			return p.native
+		}
+		return p.churnless
+	case MigrationDestinationNative:
+		if p.churnless != nil {
+			return p.churnless
+		}
+		return p.native
+	default:
+		if p.native != nil {
+			return p.native
+		}
+		return p.churnless
+	}
 }
 
 func migrationSupersededError(progress MigrationProgress) error {
@@ -406,6 +400,10 @@ func validateMigrationDestination(destination MigrationDestination) error {
 }
 
 func retryableMigrationError(err error) bool {
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	return apierrors.IsConflict(err) ||
 		apierrors.IsServerTimeout(err) ||
 		apierrors.IsTimeout(err) ||

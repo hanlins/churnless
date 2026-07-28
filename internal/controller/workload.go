@@ -35,7 +35,6 @@ import (
 
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 	"github.com/hanlins/churnless/internal/kubecompat"
-	"github.com/hanlins/churnless/internal/workloadmeta"
 )
 
 const (
@@ -45,7 +44,7 @@ const (
 	inPlaceResourcesAnnotation      = "churnless.io/in-place-resources"
 	inPlaceResourcesBestEffort      = "best-effort"
 	redeployAnnotation              = "churnless.io/redeploy-at"
-	kubectlRestartedAtAnnotation    = workloadmeta.KubectlRestartedAtAnnotation
+	kubectlRestartedAtAnnotation    = "kubectl.kubernetes.io/restartedAt"
 	podResizeSubresource            = "resize"
 )
 

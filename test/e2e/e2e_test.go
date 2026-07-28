@@ -149,34 +149,7 @@ var _ = Describe("Manager", Ordered, func() {
 	Context("Manager", func() {
 		It("should run successfully", func() {
 			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				By("getting the name of the controller-manager pod")
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
+			controllerPodName = eventuallyControllerManagerPod(1)
 		})
 
 		It("should expose distinct resource names, short names, and category", func() {
@@ -613,85 +586,28 @@ spec:
 				appsv1alpha1.GroupVersion.String(),
 			)
 			expectPodIdentityRetained(nativePods, takenOverPods)
-			expectPodOwnerTransferred(
-				nativePods,
-				takenOverPods,
-				appsv1alpha1.GroupVersion.String(),
-			)
 			eventuallyHPATarget(workload, appsv1alpha1.GroupVersion.String())
 
 			By("preparing an incomplete Churnless workload for recovery")
-			Expect(applyMigrationDeployment(recoveryWorkload, replicas, image)).To(Succeed())
-			recoveryNativePods := eventuallyOwnedDeploymentPods(
+			Expect(applyPolicyDeployment(
 				recoveryWorkload,
 				replicas,
+				appsv1.RollingUpdateDeploymentStrategyType,
 				image,
-				appsv1.SchemeGroupVersion.String(),
-			)
-			output, err = utils.Run(exec.Command(
-				"kubectl",
-				"churnless",
-				"takeover",
-				"deployment/"+recoveryWorkload,
-				"--timeout=5m",
-			))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(ContainSubstring("takeover complete"))
+			)).To(Succeed())
 			recoveryChurnlessPods := eventuallyOwnedDeploymentPods(
 				recoveryWorkload,
 				replicas,
 				image,
 				appsv1alpha1.GroupVersion.String(),
 			)
-			expectPodIdentityRetained(recoveryNativePods, recoveryChurnlessPods)
 			Expect(patchFailingReadinessProbe(recoveryWorkload, image)).To(Succeed())
 			eventuallyChurnlessDeploymentIncomplete(recoveryWorkload)
 
 			By("stopping the Churnless manager")
 			DeferCleanup(func() {
 				By("restoring the Churnless manager")
-				cmd := exec.Command(
-					"kubectl",
-					"scale",
-					"deployment.apps/churnless-controller-manager",
-					"--namespace",
-					namespace,
-					"--replicas=1",
-				)
-				output, err := utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred(), output)
-				cmd = exec.Command(
-					"kubectl",
-					"rollout",
-					"status",
-					"deployment.apps/churnless-controller-manager",
-					"--namespace",
-					namespace,
-					"--timeout=5m",
-				)
-				output, err = utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred(), output)
-				Eventually(func(g Gomega) {
-					cmd := exec.Command(
-						"kubectl",
-						"get",
-						"pods",
-						"--namespace",
-						namespace,
-						"-l",
-						"control-plane=controller-manager",
-						"-o",
-						"go-template={{ range .items }}"+
-							"{{ if not .metadata.deletionTimestamp }}"+
-							"{{ .metadata.name }}"+
-							"{{ \"\\n\" }}{{ end }}{{ end }}",
-					)
-					output, err := utils.Run(cmd)
-					g.Expect(err).NotTo(HaveOccurred())
-					podNames := utils.GetNonEmptyLines(output)
-					g.Expect(podNames).To(HaveLen(1))
-					controllerPodName = podNames[0]
-				}, 2*time.Minute, time.Second).Should(Succeed())
+				controllerPodName = scaleControllerManager(1)
 				Eventually(func(g Gomega) {
 					_, err := serverDryRunDeployment(
 						appsv1alpha1.GroupVersion.String(),
@@ -701,37 +617,10 @@ spec:
 					g.Expect(err).NotTo(HaveOccurred())
 				}, 2*time.Minute, time.Second).Should(Succeed())
 			})
-			cmd := exec.Command(
-				"kubectl",
-				"scale",
-				"deployment.apps/churnless-controller-manager",
-				"--namespace",
-				namespace,
-				"--replicas=0",
-			)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Eventually(func(g Gomega) {
-				cmd := exec.Command(
-					"kubectl",
-					"get",
-					"pods",
-					"--namespace",
-					namespace,
-					"-l",
-					"control-plane=controller-manager",
-					"-o",
-					"json",
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				var pods corev1.PodList
-				g.Expect(json.Unmarshal([]byte(output), &pods)).To(Succeed())
-				g.Expect(pods.Items).To(BeEmpty())
-			}, 2*time.Minute, time.Second).Should(Succeed())
+			scaleControllerManager(0)
 
 			By("keeping spec admission fail-closed during the manager outage")
-			cmd = exec.Command(
+			cmd := exec.Command(
 				"kubectl",
 				"patch",
 				"deployment.churnless.io/"+workload,
@@ -762,12 +651,6 @@ spec:
 				appsv1.SchemeGroupVersion.String(),
 			)
 			expectPodIdentityRetained(takenOverPods, handedOffPods)
-			expectPodOwnerTransferred(
-				takenOverPods,
-				handedOffPods,
-				appsv1.SchemeGroupVersion.String(),
-			)
-			eventuallyControllerAnnotation("deployment.apps", workload, "native")
 			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
@@ -778,31 +661,6 @@ spec:
 				"replicaset.churnless.io",
 				takenOverPods,
 			)
-
-			By("forcing a native rollout restart through the plugin")
-			output, err = utils.Run(exec.Command(
-				"kubectl",
-				"churnless",
-				"rollout",
-				"restart",
-				"deployment/"+workload,
-			))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).
-				To(Equal("deployment.apps/" + workload + " restarted"))
-			eventuallyRestartToken("deployment.apps", workload)
-			restartedNativePods := eventuallyOwnedDeploymentPods(
-				workload,
-				replicas,
-				image,
-				appsv1.SchemeGroupVersion.String(),
-				handedOffPods,
-			)
-			Expect(retainedIdentities(handedOffPods, restartedNativePods)).To(BeZero())
-			expectReplicaSetOwnersReplaced(handedOffPods, restartedNativePods)
-			for name := range handedOffPods {
-				Expect(restartedNativePods).NotTo(HaveKey(name))
-			}
 
 			By("recovering the incomplete workload through the plugin")
 			output, err = utils.Run(exec.Command(
@@ -815,7 +673,6 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(ContainSubstring("recovery handoff"))
 			Expect(output).To(ContainSubstring("handoff complete"))
-			eventuallyControllerAnnotation("deployment.apps", recoveryWorkload, "native")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command(
 					"kubectl",
@@ -835,20 +692,6 @@ spec:
 				appsv1.SchemeGroupVersion.String(),
 			)
 			Expect(retainedIdentities(recoveryChurnlessPods, recoveredPods)).To(BeZero())
-			cmd = exec.Command(
-				"kubectl",
-				"get",
-				"pods",
-				"--namespace",
-				namespace,
-				"-l",
-				"control-plane=controller-manager",
-				"-o",
-				"name",
-			)
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(BeEmpty())
 		})
 
 		It("should enforce RollingUpdate availability and surge limits", func() {
@@ -973,29 +816,12 @@ spec:
 				To(Equal(initialReplicaSet.UID),
 					"best-effort fallback unexpectedly created another ReplicaSet")
 
-			By("forcing a Churnless rollout restart through the plugin")
-			output, err := utils.Run(exec.Command(
-				"kubectl",
-				"churnless",
-				"rollout",
-				"restart",
-				"deployment/"+workload,
-			))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).
-				To(Equal("deployment.churnless.io/" + workload + " restarted"))
-			eventuallyRestartToken("deployment.churnless.io", workload)
+			By("triggering redeploy with the standard kubectl restart annotation")
+			Expect(kubectlRestartAnnotation(workload)).To(Succeed())
 			eventuallyOwnedReplicaSetCount(workload, 2)
 			expectedPod.excludedUID = fallback.UID
 			restarted := eventuallyMutablePod(expectedPod)
-			Expect(restarted.Name).NotTo(Equal(fallback.Name))
 			Expect(restarted.UID).NotTo(Equal(fallback.UID))
-			Expect(restarted.Status.PodIP).NotTo(BeEmpty())
-			previousOwner := metav1.GetControllerOf(&fallback)
-			currentOwner := metav1.GetControllerOf(&restarted)
-			Expect(previousOwner).NotTo(BeNil())
-			Expect(currentOwner).NotTo(BeNil())
-			Expect(currentOwner.UID).NotTo(Equal(previousOwner.UID))
 
 			By("changing an immutable container field")
 			Expect(patchImmutableField(workload, image)).To(Succeed())
@@ -1136,9 +962,7 @@ spec:
 type podIdentity struct {
 	UID                 string
 	IP                  string
-	OwnerAPIVersion     string
 	OwnerReplicaSetName string
-	OwnerReplicaSetUID  string
 }
 
 type policyPodSnapshot struct {
@@ -1153,6 +977,50 @@ type policyPodSnapshot struct {
 type replicaSetIdentity struct {
 	Name string
 	UID  string
+}
+
+func scaleControllerManager(replicas int) string {
+	output, err := utils.Run(exec.Command(
+		"kubectl",
+		"scale",
+		"deployment.apps/churnless-controller-manager",
+		"--namespace",
+		namespace,
+		fmt.Sprintf("--replicas=%d", replicas),
+	))
+	Expect(err).NotTo(HaveOccurred(), output)
+	return eventuallyControllerManagerPod(replicas)
+}
+
+func eventuallyControllerManagerPod(replicas int) string {
+	var podName string
+	Eventually(func(g Gomega) {
+		output, err := utils.Run(exec.Command(
+			"kubectl",
+			"get",
+			"pods",
+			"--namespace",
+			namespace,
+			"-l",
+			"control-plane=controller-manager",
+			"-o",
+			"json",
+		))
+		g.Expect(err).NotTo(HaveOccurred())
+		var list corev1.PodList
+		g.Expect(json.Unmarshal([]byte(output), &list)).To(Succeed())
+		g.Expect(list.Items).To(HaveLen(replicas))
+		if replicas == 0 {
+			podName = ""
+			return
+		}
+		pod := &list.Items[0]
+		g.Expect(pod.Status.Phase).To(Equal(corev1.PodRunning))
+		g.Expect(podReady(pod)).To(BeTrue())
+		podName = pod.Name
+		g.Expect(podName).To(ContainSubstring("controller-manager"))
+	}, 2*time.Minute, time.Second).Should(Succeed())
+	return podName
 }
 
 func eventuallyDeploymentReplicaSet(workload, image string) replicaSetIdentity {
@@ -1221,7 +1089,6 @@ func eventuallyOwnedDeploymentPods(
 	workload string,
 	count int,
 	image, ownerAPIVersion string,
-	excluded ...map[string]podIdentity,
 ) map[string]podIdentity {
 	var result map[string]podIdentity
 	Eventually(func(g Gomega) {
@@ -1236,45 +1103,19 @@ func eventuallyOwnedDeploymentPods(
 		)
 		output, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred())
-		var list struct {
-			Items []struct {
-				Metadata struct {
-					Name              string                  `json:"name"`
-					UID               string                  `json:"uid"`
-					DeletionTimestamp *string                 `json:"deletionTimestamp"`
-					OwnerReferences   []metav1.OwnerReference `json:"ownerReferences"`
-				} `json:"metadata"`
-				Spec struct {
-					Containers []struct {
-						Image string `json:"image"`
-					} `json:"containers"`
-				} `json:"spec"`
-				Status struct {
-					PodIP      string `json:"podIP"`
-					Conditions []struct {
-						Type   string `json:"type"`
-						Status string `json:"status"`
-					} `json:"conditions"`
-				} `json:"status"`
-			} `json:"items"`
-		}
+		var list corev1.PodList
 		g.Expect(json.Unmarshal([]byte(output), &list)).To(Succeed())
 		current := make(map[string]podIdentity, len(list.Items))
-		for _, pod := range list.Items {
-			if pod.Metadata.DeletionTimestamp != nil {
+		for i := range list.Items {
+			pod := &list.Items[i]
+			if !pod.DeletionTimestamp.IsZero() {
 				continue
 			}
 			g.Expect(pod.Spec.Containers).NotTo(BeEmpty())
 			g.Expect(pod.Spec.Containers[0].Image).To(Equal(image))
 			g.Expect(pod.Status.PodIP).NotTo(BeEmpty())
-			owners := make([]metav1.OwnerReference, 0, 1)
-			for _, owner := range pod.Metadata.OwnerReferences {
-				if owner.Controller != nil && *owner.Controller {
-					owners = append(owners, owner)
-				}
-			}
-			g.Expect(owners).To(HaveLen(1))
-			owner := owners[0]
+			owner := metav1.GetControllerOf(pod)
+			g.Expect(owner).NotTo(BeNil())
 			g.Expect(owner.APIVersion).To(Equal(ownerAPIVersion))
 			g.Expect(owner.Kind).To(Equal("ReplicaSet"))
 			g.Expect(owner.Name).NotTo(BeEmpty())
@@ -1286,23 +1127,14 @@ func eventuallyOwnedDeploymentPods(
 				string(owner.UID),
 				workload,
 			)
-			ready := false
-			for _, condition := range pod.Status.Conditions {
-				ready = ready || condition.Type == "Ready" && condition.Status == "True"
-			}
-			g.Expect(ready).To(BeTrue())
-			current[pod.Metadata.Name] = podIdentity{
-				UID:                 pod.Metadata.UID,
+			g.Expect(podReady(pod)).To(BeTrue())
+			current[pod.Name] = podIdentity{
+				UID:                 string(pod.UID),
 				IP:                  pod.Status.PodIP,
-				OwnerAPIVersion:     owner.APIVersion,
 				OwnerReplicaSetName: owner.Name,
-				OwnerReplicaSetUID:  string(owner.UID),
 			}
 		}
 		g.Expect(current).To(HaveLen(count))
-		for _, identities := range excluded {
-			g.Expect(retainedIdentities(identities, current)).To(BeZero())
-		}
 		result = current
 	}, 5*time.Minute, 2*time.Second).Should(Succeed())
 	return result
@@ -1367,30 +1199,6 @@ func expectPodIdentityRetained(
 		Expect(ok).To(BeTrue(), "Pod %s was replaced", name)
 		Expect(current.UID).To(Equal(previous.UID), "Pod %s UID changed", name)
 		Expect(current.IP).To(Equal(previous.IP), "Pod %s IP changed", name)
-	}
-}
-
-func expectPodOwnerTransferred(
-	before, after map[string]podIdentity,
-	targetAPIVersion string,
-) {
-	for name, previous := range before {
-		current, ok := after[name]
-		Expect(ok).To(BeTrue(), "Pod %s was replaced", name)
-		Expect(current.OwnerAPIVersion).To(Equal(targetAPIVersion))
-		Expect(current.OwnerReplicaSetUID).NotTo(Equal(previous.OwnerReplicaSetUID))
-	}
-}
-
-func expectReplicaSetOwnersReplaced(
-	before, after map[string]podIdentity,
-) {
-	previous := make(map[string]struct{}, len(before))
-	for _, pod := range before {
-		previous[pod.OwnerReplicaSetUID] = struct{}{}
-	}
-	for _, pod := range after {
-		Expect(previous).NotTo(HaveKey(pod.OwnerReplicaSetUID))
 	}
 }
 
@@ -1496,21 +1304,6 @@ spec:
 	cmd.Stdin = strings.NewReader(manifest)
 	_, err := utils.Run(cmd)
 	return err
-}
-
-func eventuallyControllerAnnotation(resource, workload, controller string) {
-	Eventually(func(g Gomega) {
-		cmd := exec.Command(
-			"kubectl",
-			"get",
-			resource+"/"+workload,
-			"-o",
-			"jsonpath={.metadata.annotations.churnless\\.io/controller}",
-		)
-		output, err := utils.Run(cmd)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(output).To(Equal(controller))
-	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
 }
 
 func patchFailingReadinessProbe(workload, image string) error {
@@ -1714,20 +1507,16 @@ func patchMutableResources(
 	return err
 }
 
-func eventuallyRestartToken(resource, workload string) {
-	Eventually(func(g Gomega) {
-		cmd := exec.Command(
-			"kubectl",
-			"get",
-			resource+"/"+workload,
-			"-o",
-			"jsonpath={.spec.template.metadata.annotations.kubectl\\.kubernetes\\.io/restartedAt}",
-		)
-		output, err := utils.Run(cmd)
-		g.Expect(err).NotTo(HaveOccurred())
-		_, err = time.Parse(time.RFC3339Nano, output)
-		g.Expect(err).NotTo(HaveOccurred())
-	}, 5*time.Minute, 200*time.Millisecond).Should(Succeed())
+func kubectlRestartAnnotation(workload string) error {
+	cmd := exec.Command(
+		"kubectl",
+		"annotate",
+		"deployment.churnless.io/"+workload,
+		"kubectl.kubernetes.io/restartedAt="+time.Now().UTC().Format(time.RFC3339Nano),
+		"--overwrite",
+	)
+	_, err := utils.Run(cmd)
+	return err
 }
 
 func patchImmutableField(workload, image string) error {

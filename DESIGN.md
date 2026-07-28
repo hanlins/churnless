@@ -60,7 +60,7 @@ object has exactly one authoritative controller:
 | --- | --- |
 | Churnless Deployment | Chooses structural revisions, creates and scales Churnless ReplicaSets, applies rollout strategy, and aggregates status. |
 | Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, applies supported Pod metadata, image, and resource changes in place, and reports status. |
-| Migration controller | Transfers a stable Deployment and its live Pods between native Kubernetes and Churnless ownership chains. |
+| Migration engine | Transfers a stable Deployment and its live Pods between native Kubernetes and Churnless ownership chains. The watched controller and kubectl plugin are two drivers of this one idempotent engine. |
 | Admission webhooks | Apply and validate the native workload semantics that CRD schemas do not inherit from built-in API storage. |
 | kubelet | Observes patched images and resource resize requests, then restarts or resizes affected containers as required. |
 
@@ -143,6 +143,14 @@ but avoids maintaining a partial fork of workload admission behavior.
 Server-side dry-run tests compare selected Churnless admission behavior with
 the native GVK. The native API server is a test oracle, not a runtime
 dependency and not a shadow controller.
+
+The Deployment and ReplicaSet webhooks run for creates and spec-changing
+updates. Metadata-only updates are excluded with admission `matchConditions`
+because the current defaulting and validation contracts operate only on
+`spec`. This keeps desired-state changes fail-closed while allowing Kubernetes
+metadata, including migration annotations and owner bookkeeping, to remain
+writable if the Churnless admission server is unavailable. Adding any future
+webhook behavior for metadata requires revisiting this condition.
 
 ## Revision model
 
@@ -270,6 +278,24 @@ kubectl annotate deployment.churnless.io/web \
   churnless.io/controller=native --overwrite
 ```
 
+The ergonomic imperative surface is a kubectl plugin:
+
+```sh
+kubectl churnless takeover deployment/web
+kubectl churnless handoff deployment/web
+```
+
+Each command records the same desired-controller annotation, repeatedly steps
+the shared migration engine through an uncached API client, reports phase
+changes, and waits for completion. Migration state lives in Kubernetes rather
+than a local checkpoint, so interruption or timeout is safe: rerunning the same
+command resumes the operation. The watched migration controller may execute
+the same deterministic steps concurrently; optimistic patches and
+UID/resource-version delete preconditions make that safe. If another actor
+requests the opposite controller, an older synchronous command reports that it
+was superseded and stops driving instead of waiting until timeout or
+overwriting the newer intent.
+
 The annotation remains on the surviving object, so its value describes the
 current desired controller and can be changed again for a later exploration or
 fallback. A same-name target Deployment must not already exist, and migration
@@ -339,7 +365,18 @@ cannot remain stuck waiting on the controller it is intended to replace.
 The migration controller emits Kubernetes Events for pending takeover,
 migration start, recovery start, cutover, cancellation, and completion. These
 events are the user-facing progress and diagnostic surface while both GVKs
-temporarily coexist.
+temporarily coexist. Events are optional observability, never required
+migration state; the kubectl plugin reports progress directly and does not
+require Event-create permission.
+
+An emergency handoff can complete while the entire Churnless manager is down.
+Metadata-only source and ReplicaSet updates do not call the unavailable
+webhooks, the plugin replaces the watched migration loop, and native
+Deployment/ReplicaSet controllers warm the destination. Healthy handoff can
+still preserve Pod identity; an incomplete Churnless source uses recovery
+handoff as described above. The plugin cannot make a Churnless target
+operational without the Churnless admission, Deployment, and ReplicaSet
+controllers, so takeover still requires a healthy Churnless manager.
 
 Migration currently covers Deployments, not standalone ReplicaSets. The
 controller rewrites these namespaced workload references when they point to
@@ -386,6 +423,13 @@ Every controller change must preserve these invariants:
   created its desired Pod count.
 - Migration state is recoverable from the target Deployment and source
   ReplicaSet annotations after a controller restart.
+- Durable migration state has an explicit version and fails closed on an
+  unknown version, phase, mode, or desired-controller value before ownership
+  is orphaned.
+- Per-Pod deletion cost is recorded before migration preference is applied and
+  restored exactly after completion or cancellation.
+- The watched controller and synchronous kubectl driver execute the same
+  migration state machine; neither carries a second cutover implementation.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
   another batch from stale informer state.
 - Structural rollout scale-up continues counting observed active ReplicaSet
@@ -452,8 +496,13 @@ The acceptance suite must continue to verify:
 - Native takeover and emergency handoff preserve live Pod identity while
   changing the authoritative Deployment and ReplicaSet GVKs, and a real HPA
   follows the workload in both directions.
-- An unhealthy Churnless rollout can return to native ownership without
-  waiting for Churnless completion; this recovery path may replace Pods.
+- The kubectl plugin can hand a healthy workload to native Kubernetes with the
+  Churnless manager scaled to zero, preserving Pod name, UID, and IP and
+  retargeting a real HPA; metadata updates remain available while spec changes
+  remain fail-closed during that outage.
+- With the manager still scaled to zero, the plugin can also return an
+  incomplete Churnless rollout to native ownership without waiting for
+  Churnless completion; this recovery path intentionally replaces Pods.
 - Deployment and ReplicaSet defaults, plus critical invalid-selector behavior,
   match their native GVKs under server-side dry-run.
 

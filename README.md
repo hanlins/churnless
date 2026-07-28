@@ -193,6 +193,16 @@ subresource.
 Churnless uses one desired-controller annotation for the whole workflow:
 `churnless.io/controller=churnless|native`.
 
+Build and install the kubectl plugin from a checkout. Ensure Go's bin
+directory is on `PATH` so kubectl can discover the `kubectl-churnless`
+executable:
+
+```sh
+make install-plugin
+kubectl plugin list
+kubectl churnless --help
+```
+
 Before starting, wait for the native Deployment to finish its rollout and
 pause any GitOps or other automation that would recreate the deleted source
 GVK or revert dependent references. Optionally record current Pod identity:
@@ -206,30 +216,40 @@ kubectl get pods -l app=web \
 Move the workload to Churnless:
 
 ```sh
-kubectl annotate deployment.apps/web \
-  churnless.io/controller=churnless --overwrite
-kubectl wait --for=delete deployment.apps/web --timeout=5m
-kubectl wait --for=condition=Available \
-  deployment.churnless.io/web --timeout=5m
+kubectl churnless takeover deployment/web
 ```
 
-The controller creates `deployment.churnless.io/web`, transfers the live Pods,
-and leaves `churnless.io/controller=churnless` on the surviving object. Inspect
-progress or diagnose a blocked migration with:
-
-```sh
-kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
-kubectl get events --field-selector involvedObject.name=web \
-  --sort-by=.lastTimestamp
-```
+The command requests `churnless.io/controller=churnless`, drives the same
+idempotent migration engine used by the in-cluster controller, waits for
+completion, and prints phase changes. It creates
+`deployment.churnless.io/web`, transfers the live Pods, and leaves the desired
+controller annotation on the surviving object. A timeout or interruption does
+not roll state back; rerun the same command to resume from the durable target
+metadata. If another operator requests the opposite controller while the
+command is running, the older command exits with a superseded message instead
+of fighting the newer intent.
 
 Return to the native controller at any time:
 
 ```sh
+kubectl churnless handoff deployment/web
+```
+
+`handoff` remains usable when the complete Churnless manager, including its
+migration controller and admission server, is unavailable. Metadata-only
+updates bypass the Churnless webhooks, while creates and spec-changing updates
+remain fail-closed. The plugin coordinates the transfer directly through the
+Kubernetes API, and the native Deployment and ReplicaSet controllers warm the
+target. A takeover still requires the Churnless admission and workload
+controllers because only they can make a Churnless target operational.
+
+The annotation-only workflow remains available for declarative automation:
+
+```sh
+kubectl annotate deployment.apps/web \
+  churnless.io/controller=churnless --overwrite
 kubectl annotate deployment.churnless.io/web \
   churnless.io/controller=native --overwrite
-kubectl wait --for=delete deployment.churnless.io/web --timeout=5m
-kubectl get deployment.apps/web
 ```
 
 When the Churnless rollout is healthy, handoff retains ready Pod identity when
@@ -252,8 +272,16 @@ migration, the source spec must stay unchanged and a same-name target GVK must
 not be created manually. Migration never starts from an already-deleting
 source. Temporary target Pods can briefly increase Pod and resource counts.
 
+Inspect current objects and controller-driven Events with:
+
+```sh
+kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
+kubectl get events --field-selector involvedObject.name=web \
+  --sort-by=.lastTimestamp
+```
+
 This migration currently supports Deployments only. Before cutover, the
-controller automatically retargets HorizontalPodAutoscaler,
+shared migration engine automatically retargets HorizontalPodAutoscaler,
 VerticalPodAutoscaler, and KEDA ScaledObject references to the new Deployment
 GVK. Services, PodDisruptionBudgets, and other selector-based resources keep
 matching the same Pod labels. Custom resources with other explicit workload

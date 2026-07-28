@@ -712,6 +712,236 @@ spec:
 			Expect(retainedIdentities(takenOverPods, recoveredPods)).To(BeZero())
 		})
 
+		It("should preserve and recover handoffs with the Churnless manager unavailable", func() {
+			const (
+				workload         = "plugin-manager-down"
+				recoveryWorkload = "plugin-recovery-down"
+				image            = "nginx:1.28-alpine"
+				replicas         = 2
+			)
+			DeferCleanup(func() {
+				for _, resource := range []string{
+					"horizontalpodautoscaler.autoscaling/" + workload,
+					"deployment.apps/" + workload,
+					"deployment.churnless.io/" + workload,
+					"deployment.apps/" + recoveryWorkload,
+					"deployment.churnless.io/" + recoveryWorkload,
+				} {
+					cmd := exec.Command("kubectl", "delete", resource, "--ignore-not-found")
+					_, _ = utils.Run(cmd)
+				}
+			})
+
+			By("taking over a healthy native Deployment through the plugin")
+			Expect(applyMigrationDeployment(workload, replicas, image)).To(Succeed())
+			Expect(applyMigrationHPA(workload, replicas)).To(Succeed())
+			nativePods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			output, err := utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"takeover",
+				"deployment/"+workload,
+				"--timeout=5m",
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("takeover complete"))
+			takenOverPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1alpha1.GroupVersion.String(),
+			)
+			expectPodIdentityRetained(nativePods, takenOverPods)
+			eventuallyHPATarget(workload, appsv1alpha1.GroupVersion.String())
+
+			By("preparing an incomplete Churnless workload for recovery")
+			Expect(applyMigrationDeployment(recoveryWorkload, replicas, image)).To(Succeed())
+			recoveryNativePods := eventuallyOwnedDeploymentPods(
+				recoveryWorkload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			output, err = utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"takeover",
+				"deployment/"+recoveryWorkload,
+				"--timeout=5m",
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("takeover complete"))
+			recoveryChurnlessPods := eventuallyOwnedDeploymentPods(
+				recoveryWorkload,
+				replicas,
+				image,
+				appsv1alpha1.GroupVersion.String(),
+			)
+			expectPodIdentityRetained(recoveryNativePods, recoveryChurnlessPods)
+			Expect(patchFailingReadinessProbe(recoveryWorkload, image)).To(Succeed())
+			eventuallyChurnlessDeploymentIncomplete(recoveryWorkload)
+
+			By("stopping the Churnless manager")
+			DeferCleanup(func() {
+				By("restoring the Churnless manager")
+				cmd := exec.Command(
+					"kubectl",
+					"scale",
+					"deployment.apps/churnless-controller-manager",
+					"--namespace",
+					namespace,
+					"--replicas=1",
+				)
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), output)
+				cmd = exec.Command(
+					"kubectl",
+					"rollout",
+					"status",
+					"deployment.apps/churnless-controller-manager",
+					"--namespace",
+					namespace,
+					"--timeout=5m",
+				)
+				output, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), output)
+				Eventually(func(g Gomega) {
+					cmd := exec.Command(
+						"kubectl",
+						"get",
+						"pods",
+						"--namespace",
+						namespace,
+						"-l",
+						"control-plane=controller-manager",
+						"-o",
+						"go-template={{ range .items }}"+
+							"{{ if not .metadata.deletionTimestamp }}"+
+							"{{ .metadata.name }}"+
+							"{{ \"\\n\" }}{{ end }}{{ end }}",
+					)
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					podNames := utils.GetNonEmptyLines(output)
+					g.Expect(podNames).To(HaveLen(1))
+					controllerPodName = podNames[0]
+				}, 2*time.Minute, time.Second).Should(Succeed())
+				Eventually(func(g Gomega) {
+					_, err := serverDryRunDeployment(
+						appsv1alpha1.GroupVersion.String(),
+						"webhook-restored",
+						true,
+					)
+					g.Expect(err).NotTo(HaveOccurred())
+				}, 2*time.Minute, time.Second).Should(Succeed())
+			})
+			cmd := exec.Command(
+				"kubectl",
+				"scale",
+				"deployment.apps/churnless-controller-manager",
+				"--namespace",
+				namespace,
+				"--replicas=0",
+			)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command(
+					"kubectl",
+					"get",
+					"pods",
+					"--namespace",
+					namespace,
+					"-l",
+					"control-plane=controller-manager",
+					"-o",
+					"json",
+				)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				var pods corev1.PodList
+				g.Expect(json.Unmarshal([]byte(output), &pods)).To(Succeed())
+				g.Expect(pods.Items).To(BeEmpty())
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("keeping spec admission fail-closed during the manager outage")
+			cmd = exec.Command(
+				"kubectl",
+				"patch",
+				"deployment.churnless.io/"+workload,
+				"--type=merge",
+				"--patch",
+				`{"spec":{"paused":true}}`,
+				"--request-timeout=5s",
+			)
+			output, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred())
+			Expect(output).To(ContainSubstring("failed calling webhook"))
+			Expect(output).To(ContainSubstring("churnless-webhook-service"))
+
+			By("driving an identity-preserving native handoff through the plugin")
+			output, err = utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"handoff",
+				"deployment/"+workload,
+				"--timeout=5m",
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("handoff complete"))
+			handedOffPods := eventuallyOwnedDeploymentPods(
+				workload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			expectPodIdentityRetained(takenOverPods, handedOffPods)
+			eventuallyControllerAnnotation("deployment.apps", workload, "native")
+			eventuallyHPATarget(workload, appsv1.SchemeGroupVersion.String())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment.churnless.io/"+workload)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+			}).Should(Succeed())
+
+			By("recovering the incomplete workload through the plugin")
+			output, err = utils.Run(exec.Command(
+				"kubectl",
+				"churnless",
+				"handoff",
+				"deployment/"+recoveryWorkload,
+				"--timeout=5m",
+			))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(ContainSubstring("recovery handoff"))
+			Expect(output).To(ContainSubstring("handoff complete"))
+			eventuallyControllerAnnotation("deployment.apps", recoveryWorkload, "native")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command(
+					"kubectl",
+					"get",
+					"deployment.churnless.io/"+recoveryWorkload,
+				)
+				_, err := utils.Run(cmd)
+				g.Expect(err).To(HaveOccurred())
+			}, 5*time.Minute, time.Second).Should(Succeed())
+
+			By("fixing the recovered workload under native ownership")
+			Expect(removeNativeReadinessProbe(recoveryWorkload)).To(Succeed())
+			recoveredPods := eventuallyOwnedDeploymentPods(
+				recoveryWorkload,
+				replicas,
+				image,
+				appsv1.SchemeGroupVersion.String(),
+			)
+			Expect(retainedIdentities(recoveryChurnlessPods, recoveredPods)).To(BeZero())
+		})
+
 		It("should enforce RollingUpdate availability and surge limits", func() {
 			const (
 				workload = "rolling-policy"

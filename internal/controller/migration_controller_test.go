@@ -35,10 +35,16 @@ import (
 	appsv1alpha1 "github.com/hanlins/churnless/api/v1alpha1"
 )
 
+const (
+	migrationTestNamespace = "default"
+	migrationTestImage     = "registry.k8s.io/pause:3.10"
+	invalidMigrationState  = "unknown"
+)
+
 var _ = Describe("Migration Controller", func() {
 	const (
-		namespace             = "default"
-		image                 = "registry.k8s.io/pause:3.10"
+		namespace             = migrationTestNamespace
+		image                 = migrationTestImage
 		testDeletionFinalizer = "test.churnless.io/block-deletion"
 	)
 
@@ -61,6 +67,10 @@ var _ = Describe("Migration Controller", func() {
 			"deleting-target-test",
 			"late-return-test",
 			"adoption-test",
+			"driver-request-test",
+			"request-delete-race-test",
+			"invalid-state-test",
+			"target-create-race-test",
 		} {
 			deletePodsWithLabel(ctx, namespace, name)
 			deleteIfPresent(ctx, &autoscalingv2.HorizontalPodAutoscaler{
@@ -148,6 +158,7 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
 		Expect(target.Annotations[migrationSourceAnnotation]).To(Equal(nativeDeploymentSource))
 		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModePreserve))
+		Expect(target.Annotations[migrationStateVersionAnnotation]).To(Equal(migrationStateVersion))
 		Expect(target.Annotations[migrationIDAnnotation]).To(Equal(string(source.UID)))
 		Expect(target.Annotations[migrationPhaseAnnotation]).To(Equal(migrationPhaseWarming))
 		Expect(target.Annotations[migrationOriginalPausedAnnotation]).To(Equal(annotationEnabledValue))
@@ -159,6 +170,54 @@ var _ = Describe("Migration Controller", func() {
 		Expect(k8sClient.Get(ctx, key, hpa)).To(Succeed())
 		Expect(hpa.Spec.ScaleTargetRef.APIVersion).
 			To(Equal(appsv1alpha1.GroupVersion.String()))
+	})
+
+	It("resumes when another driver creates the takeover target", func() {
+		const name = "target-create-race-test"
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		source := nativeMigrationTestDeployment(name, churnlessControllerValue)
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		replicas := *source.Spec.Replicas
+		source.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: source.Generation,
+			Replicas:           replicas,
+			UpdatedReplicas:    replicas,
+			ReadyReplicas:      replicas,
+			AvailableReplicas:  replicas,
+		}
+		Expect(k8sClient.Status().Update(ctx, source)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+
+		target := &appsv1alpha1.Deployment{
+			ObjectMeta: migrationTargetMetadata(
+				source.ObjectMeta,
+				source.UID,
+				source.Generation,
+				source.Spec.Paused,
+				nativeDeploymentSource,
+				migrationModePreserve,
+			),
+			Spec: appsv1alpha1.DeploymentSpec{
+				DeploymentSpec: *source.Spec.DeepCopy(),
+			},
+		}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+		targetUID := target.UID
+
+		result, err := reconciler.startTakeover(ctx, source)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{Requeue: true}))
+		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
+		Expect(target.UID).To(Equal(targetUID))
+
+		progress, err := reconciler.InspectMigration(
+			ctx,
+			key,
+			MigrationDestinationChurnless,
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(progress.Phase).To(Equal(migrationPhaseWarming))
 	})
 
 	It("creates a native target for a complete Churnless Deployment", func() {
@@ -228,6 +287,7 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Annotations[controllerAnnotation]).To(Equal(nativeControllerValue))
 		Expect(target.Annotations[migrationSourceAnnotation]).To(Equal(churnlessDeploymentSource))
 		Expect(target.Annotations[migrationModeAnnotation]).To(Equal(migrationModePreserve))
+		Expect(target.Annotations[migrationStateVersionAnnotation]).To(Equal(migrationStateVersion))
 		Expect(target.Annotations[migrationIDAnnotation]).To(Equal(string(source.UID)))
 		Expect(target.Annotations[migrationOriginalPausedAnnotation]).To(Equal(annotationEnabledValue))
 		Expect(target.Spec.Paused).To(BeFalse())
@@ -236,6 +296,134 @@ var _ = Describe("Migration Controller", func() {
 		Expect(target.Spec.Template.Spec.Containers[0].Image).
 			To(Equal(source.Spec.Template.Spec.Containers[0].Image))
 	})
+
+	It("records an imperative handoff request on the Churnless source", func() {
+		const name = "driver-request-test"
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		source := churnlessMigrationTestDeployment(
+			name,
+			churnlessControllerValue,
+		)
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+
+		Expect(reconciler.RequestMigration(
+			ctx,
+			key,
+			MigrationDestinationNative,
+		)).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		Expect(source.Annotations[controllerAnnotation]).To(Equal(nativeControllerValue))
+	})
+
+	It("re-resolves the request target when the source disappears before patch", func() {
+		const name = "request-delete-race-test"
+		key := types.NamespacedName{Name: name, Namespace: namespace}
+		source := churnlessMigrationTestDeployment(name, nativeControllerValue)
+		Expect(k8sClient.Create(ctx, source)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		target := &appsv1.Deployment{
+			ObjectMeta: migrationTargetMetadata(
+				source.ObjectMeta,
+				source.UID,
+				source.Generation,
+				source.Spec.Paused,
+				churnlessDeploymentSource,
+				migrationModePreserve,
+			),
+			Spec: *source.Spec.DeploymentSpec.DeepCopy(),
+		}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+
+		racingClient := &deleteBeforePatchClient{
+			Client:       k8sClient,
+			deleteObject: source.DeepCopy(),
+		}
+		racingReconciler := &MigrationReconciler{
+			Client:    racingClient,
+			APIReader: racingClient,
+			Scheme:    k8sClient.Scheme(),
+		}
+		Expect(racingReconciler.RequestMigration(
+			ctx,
+			key,
+			MigrationDestinationChurnless,
+		)).To(Succeed())
+		Expect(racingClient.deleted).To(BeTrue())
+		Expect(k8sClient.Get(ctx, key, source)).To(Satisfy(apierrors.IsNotFound))
+		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
+		Expect(target.Annotations[controllerAnnotation]).To(Equal(churnlessControllerValue))
+	})
+
+	DescribeTable(
+		"fails closed on malformed durable migration state",
+		func(mutate func(map[string]string), expectedError string) {
+			const name = "invalid-state-test"
+			key := types.NamespacedName{Name: name, Namespace: namespace}
+			source := nativeMigrationTestDeployment(
+				name,
+				churnlessControllerValue,
+			)
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+			targetMetadata := migrationTargetMetadata(
+				source.ObjectMeta,
+				source.UID,
+				source.Generation,
+				source.Spec.Paused,
+				nativeDeploymentSource,
+				migrationModePreserve,
+			)
+			mutate(targetMetadata.Annotations)
+			target := &appsv1alpha1.Deployment{
+				ObjectMeta: targetMetadata,
+				Spec: appsv1alpha1.DeploymentSpec{
+					DeploymentSpec: *source.Spec.DeepCopy(),
+				},
+			}
+			Expect(k8sClient.Create(ctx, target)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).To(MatchError(ContainSubstring(expectedError)))
+			Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+			Expect(source.DeletionTimestamp.IsZero()).To(BeTrue())
+		},
+		Entry(
+			"with an unknown state version",
+			func(annotations map[string]string) {
+				annotations[migrationStateVersionAnnotation] = invalidMigrationState
+			},
+			"unsupported migration state version",
+		),
+		Entry(
+			"with an unknown phase",
+			func(annotations map[string]string) {
+				annotations[migrationPhaseAnnotation] = invalidMigrationState
+			},
+			"unsupported migration phase",
+		),
+		Entry(
+			"with an unknown mode",
+			func(annotations map[string]string) {
+				annotations[migrationModeAnnotation] = invalidMigrationState
+			},
+			"unsupported migration mode",
+		),
+		Entry(
+			"with an unknown desired controller",
+			func(annotations map[string]string) {
+				annotations[controllerAnnotation] = invalidMigrationState
+			},
+			"unsupported desired controller",
+		),
+		Entry(
+			"with recovery mode during takeover",
+			func(annotations map[string]string) {
+				annotations[migrationModeAnnotation] = migrationModeRecovery
+			},
+			"recovery mode is not supported for takeover",
+		),
+	)
 
 	It("starts recovery handoff before an unhealthy Churnless rollout completes", func() {
 		const name = "recovery-test"
@@ -276,8 +464,6 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := nativeMigrationTestDeployment(
 			name,
-			namespace,
-			image,
 			churnlessControllerValue,
 		)
 		source.Finalizers = []string{testDeletionFinalizer}
@@ -309,8 +495,6 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := nativeMigrationTestDeployment(
 			name,
-			namespace,
-			image,
 			churnlessControllerValue,
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
@@ -362,18 +546,18 @@ var _ = Describe("Migration Controller", func() {
 		}
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
+		targetMetadata := migrationTargetMetadata(
+			source.ObjectMeta,
+			source.UID,
+			source.Generation,
+			source.Spec.Paused,
+			nativeDeploymentSource,
+			migrationModePreserve,
+		)
+		targetMetadata.Annotations[controllerAnnotation] = nativeControllerValue
 		target := &appsv1alpha1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
-				Annotations: map[string]string{
-					controllerAnnotation:      nativeControllerValue,
-					migrationIDAnnotation:     string(source.UID),
-					migrationModeAnnotation:   migrationModePreserve,
-					migrationSourceAnnotation: nativeDeploymentSource,
-				},
-			},
-			Spec: appsv1alpha1.DeploymentSpec{DeploymentSpec: *source.Spec.DeepCopy()},
+			ObjectMeta: targetMetadata,
+			Spec:       appsv1alpha1.DeploymentSpec{DeploymentSpec: *source.Spec.DeepCopy()},
 		}
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
 		hpa := &autoscalingv2.HorizontalPodAutoscaler{
@@ -411,8 +595,6 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := churnlessMigrationTestDeployment(
 			name,
-			namespace,
-			image,
 			nativeControllerValue,
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
@@ -467,8 +649,6 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := churnlessMigrationTestDeployment(
 			name,
-			namespace,
-			image,
 			nativeControllerValue,
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
@@ -497,8 +677,6 @@ var _ = Describe("Migration Controller", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := churnlessMigrationTestDeployment(
 			name,
-			namespace,
-			image,
 			nativeControllerValue,
 		)
 		source.Finalizers = []string{testDeletionFinalizer}
@@ -608,8 +786,42 @@ var _ = Describe("Migration Controller", func() {
 		Expect(pod.Labels[structuralRevisionLabel]).To(Equal("original"))
 		Expect(pod.Annotations).NotTo(HaveKey(migrationIDAnnotation))
 		Expect(pod.Annotations).NotTo(HaveKey(migrationRoleAnnotation))
-		Expect(pod.Annotations).NotTo(HaveKey(corev1.PodDeletionCost))
+		Expect(pod.Annotations[corev1.PodDeletionCost]).To(Equal("7"))
+		Expect(pod.Annotations).NotTo(HaveKey(migrationOriginalDeletionCost))
 	})
+
+	DescribeTable(
+		"restores the exact Pod deletion-cost annotation state",
+		func(original map[string]string, present bool, value string) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					corev1.PodDeletionCost: sourceDeletionCost,
+					migrationOriginalDeletionCost: migrationDeletionCostSnapshot(
+						original,
+					),
+				},
+			}}
+			restoreMigrationDeletionCost(pod, &corev1.PodTemplateSpec{})
+
+			restored, restoredPresent := pod.Annotations[corev1.PodDeletionCost]
+			Expect(restoredPresent).To(Equal(present))
+			Expect(restored).To(Equal(value))
+			Expect(pod.Annotations).NotTo(HaveKey(migrationOriginalDeletionCost))
+		},
+		Entry("when absent", nil, false, ""),
+		Entry(
+			"when present with an empty value",
+			map[string]string{corev1.PodDeletionCost: ""},
+			true,
+			"",
+		),
+		Entry(
+			"when present with a numeric value",
+			map[string]string{corev1.PodDeletionCost: "7"},
+			true,
+			"7",
+		),
+	)
 
 	It("explicitly adopts orphaned migration Pods into the target ReplicaSet", func() {
 		const name = "adoption-test"
@@ -653,6 +865,27 @@ var _ = Describe("Migration Controller", func() {
 	})
 })
 
+type deleteBeforePatchClient struct {
+	client.Client
+	deleteObject client.Object
+	deleted      bool
+}
+
+func (c *deleteBeforePatchClient) Patch(
+	ctx context.Context,
+	object client.Object,
+	patch client.Patch,
+	options ...client.PatchOption,
+) error {
+	if !c.deleted {
+		c.deleted = true
+		if err := c.Delete(ctx, c.deleteObject); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, object, patch, options...)
+}
+
 func clearFinalizersAfterTest(ctx context.Context, object client.Object) {
 	DeferCleanup(func() {
 		fresh := object.DeepCopyObject().(client.Object)
@@ -670,27 +903,27 @@ func clearFinalizersAfterTest(ctx context.Context, object client.Object) {
 }
 
 func nativeMigrationTestDeployment(
-	name, namespace, image, controller string,
+	name, controller string,
 ) *appsv1.Deployment {
 	replicas := int32(1)
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
-			Namespace:   namespace,
+			Namespace:   migrationTestNamespace,
 			Annotations: map[string]string{controllerAnnotation: controller},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
-			Template: podTemplate(name, image),
+			Template: podTemplate(name, migrationTestImage),
 		},
 	}
 }
 
 func churnlessMigrationTestDeployment(
-	name, namespace, image, controller string,
+	name, controller string,
 ) *appsv1alpha1.Deployment {
-	native := nativeMigrationTestDeployment(name, namespace, image, controller)
+	native := nativeMigrationTestDeployment(name, controller)
 	return &appsv1alpha1.Deployment{
 		ObjectMeta: *native.ObjectMeta.DeepCopy(),
 		Spec: appsv1alpha1.DeploymentSpec{

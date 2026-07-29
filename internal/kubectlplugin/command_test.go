@@ -19,6 +19,7 @@ package kubectlplugin
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -30,6 +31,8 @@ import (
 )
 
 const commandTestNamespace, commandTestWorkload = "team", "web"
+
+var errCommandTestRestart = errors.New("restart failed")
 
 type fakeTransferer struct {
 	key         types.NamespacedName
@@ -50,6 +53,22 @@ func (f *fakeTransferer) Transfer(
 	return nil
 }
 
+type fakeRestarter struct {
+	namespace string
+	reference deploymentReference
+	err       error
+}
+
+func (f *fakeRestarter) Restart(
+	_ context.Context, namespace string, reference deploymentReference,
+) (string, error) {
+	f.namespace, f.reference = namespace, reference
+	if f.err != nil {
+		return "", f.err
+	}
+	return "deployment.churnless.io/" + commandTestWorkload, nil
+}
+
 func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 	t.Parallel()
 
@@ -67,6 +86,7 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 			runner.observe = observe
 			return runner, nil
 		},
+		nil,
 	)
 	command.SetArgs([]string{
 		handoffCommand,
@@ -91,6 +111,79 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 	if got, want := output.String(),
 		"deployment/web: handoff complete; native Kubernetes is authoritative\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestRestartCommandHelp(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	command := newCommand(
+		genericclioptions.IOStreams{Out: &output, ErrOut: &output},
+		genericclioptions.NewConfigFlags(true),
+		nil,
+		nil,
+	)
+	command.SetArgs([]string{rolloutCommand, "restart", "--help"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"restart deployment/NAME",
+		"Force a new native Kubernetes or Churnless rollout",
+		"kubectl churnless rollout restart deployment/web",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("help missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestRestartCommandReportsOnlySuccess(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantOutput string
+	}{
+		{name: "success", wantOutput: "deployment.churnless.io/web restarted\n"},
+		{name: "failure", err: errCommandTestRestart},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var output bytes.Buffer
+			configFlags := genericclioptions.NewConfigFlags(true)
+			server, insecure := "https://127.0.0.1", true
+			configFlags.APIServer, configFlags.Insecure = &server, &insecure
+			restarter := &fakeRestarter{err: test.err}
+			command := newCommand(
+				genericclioptions.IOStreams{Out: &output, ErrOut: &output},
+				configFlags,
+				nil,
+				func(*rest.Config) (restarted, error) { return restarter, nil },
+			)
+			command.SetArgs([]string{
+				rolloutCommand, "restart", "deployment/" + commandTestWorkload,
+				"--namespace", commandTestNamespace,
+			})
+
+			err := command.ExecuteContext(context.Background())
+			if !errors.Is(err, test.err) {
+				t.Fatalf("error = %v, want %v", err, test.err)
+			}
+			if restarter.namespace != commandTestNamespace ||
+				restarter.reference != (deploymentReference{
+					name: commandTestWorkload,
+					api:  deploymentAPIAny,
+				}) {
+				t.Fatalf("restart target = %q %#v", restarter.namespace, restarter.reference)
+			}
+			if got := output.String(); got != test.wantOutput {
+				t.Fatalf("output = %q, want %q", got, test.wantOutput)
+			}
+		})
 	}
 }
 
@@ -160,6 +253,7 @@ func TestTransferCommandUsageNamesSourceAPI(t *testing.T) {
 		genericclioptions.IOStreams{},
 		genericclioptions.NewConfigFlags(true),
 		nil,
+		nil,
 	)
 	tests := map[string]struct {
 		use     string
@@ -199,6 +293,24 @@ func TestParseDeploymentReferenceRejectsInvalidResources(t *testing.T) {
 	} {
 		if _, err := parseDeploymentReference(resource); err == nil {
 			t.Fatalf("parseDeploymentReference(%q) succeeded", resource)
+		}
+	}
+}
+
+func TestParseDeploymentReference(t *testing.T) {
+	t.Parallel()
+
+	for resource, wantAPI := range map[string]deploymentAPI{
+		"deployment/web":              deploymentAPIAny,
+		"deployment.apps/web":         deploymentAPINative,
+		"deployment.churnless.io/web": deploymentAPIChurnless,
+	} {
+		got, err := parseDeploymentReference(resource)
+		if err != nil {
+			t.Fatalf("parseDeploymentReference(%q): %v", resource, err)
+		}
+		if got != (deploymentReference{name: commandTestWorkload, api: wantAPI}) {
+			t.Fatalf("parseDeploymentReference(%q) = %#v", resource, got)
 		}
 	}
 }

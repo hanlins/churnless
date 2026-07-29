@@ -147,16 +147,20 @@ kubectl annotate deployment.churnless.io/deployment-sample \
 If Kubernetes rejects a resize, Churnless replaces that Pod under the normal
 rollout availability budget.
 
-Explicitly replace every Pod even when the template is otherwise unchanged:
+Install the plugin from the checkout, then explicitly replace every Pod even
+when the template is otherwise unchanged:
 
 ```sh
-kubectl annotate deployment.churnless.io/deployment-sample \
-  kubectl.kubernetes.io/restartedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+make install-plugin
+kubectl churnless rollout restart deployment/deployment-sample
 ```
 
-The built-in `kubectl rollout restart` command cannot decode custom Deployment
-GVKs. Churnless accepts its standard annotation key through generic
-`kubectl annotate`; `churnless.io/redeploy-at` remains an equivalent alias.
+The plugin resolves whether the name belongs to a native or Churnless
+Deployment, writes Kubernetes' standard restart annotation to its Pod
+template, and prints the resolved GVK. Use an explicit resource such as
+`deployment.apps/web` or `deployment.churnless.io/web` if both GVKs exist.
+The command records the restart request; it does not wait for rollout
+completion.
 
 Clean up:
 

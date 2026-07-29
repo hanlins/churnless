@@ -38,6 +38,7 @@ const (
 	defaultTransferTimeout      = 5 * time.Minute
 	takeoverCommand             = "takeover"
 	handoffCommand              = "handoff"
+	rolloutCommand              = "rollout"
 	deploymentResource          = "deployment"
 	nativeDeploymentResource    = "deployment.apps"
 	churnlessDeploymentResource = "deployment.churnless.io"
@@ -62,22 +63,37 @@ type transferred interface {
 
 type transfererFactory func(*rest.Config, func(controller.MigrationProgress)) (transferred, error)
 
+type restarted interface {
+	Restart(context.Context, string, deploymentReference) (string, error)
+}
+
+type restarterFactory func(*rest.Config) (restarted, error)
+
 // NewCommand creates the kubectl-churnless command tree.
 func NewCommand(streams genericclioptions.IOStreams) *cobra.Command {
-	return newCommand(streams, genericclioptions.NewConfigFlags(true), newTransferer)
+	return newCommand(
+		streams,
+		genericclioptions.NewConfigFlags(true),
+		newTransferer,
+		newRestarter,
+	)
 }
 
 func newCommand(
 	streams genericclioptions.IOStreams,
 	configFlags *genericclioptions.ConfigFlags,
 	transferFactory transfererFactory,
+	restartFactory restarterFactory,
 ) *cobra.Command {
 	command := &cobra.Command{
 		Use:           "churnless",
-		Short:         "Transfer Deployments between native Kubernetes and Churnless",
+		Short:         "Operate on native Kubernetes and Churnless workloads",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 	}
+	command.SetIn(streams.In)
+	command.SetOut(streams.Out)
+	command.SetErr(streams.ErrOut)
 	configFlags.AddFlags(command.PersistentFlags())
 	command.AddCommand(
 		newTransferCommand(
@@ -90,6 +106,7 @@ func newCommand(
 			"Transfer a Churnless Deployment to native Kubernetes",
 			controller.MigrationDestinationNative,
 		),
+		newRolloutCommand(streams, configFlags, restartFactory),
 	)
 	return command
 }
@@ -146,6 +163,49 @@ func newTransferCommand(
 		"Maximum time to drive the transfer; rerun the same command to resume",
 	)
 	return command
+}
+
+func newRolloutCommand(
+	streams genericclioptions.IOStreams,
+	configFlags *genericclioptions.ConfigFlags,
+	factory restarterFactory,
+) *cobra.Command {
+	command := &cobra.Command{Use: rolloutCommand, Short: "Manage workload rollouts"}
+	command.AddCommand(newRestartCommand(streams, configFlags, factory))
+	return command
+}
+
+func newRestartCommand(
+	streams genericclioptions.IOStreams,
+	configFlags *genericclioptions.ConfigFlags,
+	factory restarterFactory,
+) *cobra.Command {
+	return &cobra.Command{
+		Use:     "restart deployment/NAME",
+		Short:   "Force a new native Kubernetes or Churnless rollout",
+		Example: "  kubectl churnless rollout restart deployment/web",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			reference, err := parseDeploymentReference(args[0])
+			if err != nil {
+				return err
+			}
+			namespace, config, err := commandTarget(configFlags)
+			if err != nil {
+				return err
+			}
+			restarter, err := factory(config)
+			if err != nil {
+				return fmt.Errorf("create restart client: %w", err)
+			}
+			canonical, err := restarter.Restart(command.Context(), namespace, reference)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(streams.Out, "%s restarted\n", canonical)
+			return nil
+		},
+	}
 }
 
 func commandTarget(configFlags *genericclioptions.ConfigFlags) (string, *rest.Config, error) {
@@ -229,6 +289,14 @@ func newTransferer(
 		Engine:  engine,
 		Observe: observe,
 	}, nil
+}
+
+func newRestarter(config *rest.Config) (restarted, error) {
+	k8sClient, _, err := newKubernetesClient(config)
+	if err != nil {
+		return nil, err
+	}
+	return newDeploymentRestarter(k8sClient, time.Now), nil
 }
 
 func newKubernetesClient(config *rest.Config) (client.Client, *runtime.Scheme, error) {

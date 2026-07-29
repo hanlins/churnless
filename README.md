@@ -219,9 +219,12 @@ Move the workload to Churnless, then return it to native Kubernetes when
 needed:
 
 ```sh
-kubectl churnless takeover deployment/web
-kubectl churnless handoff deployment/web
+kubectl churnless takeover deployment.apps/web
+kubectl churnless handoff deployment.churnless.io/web
 ```
+
+The argument names the source API; `deploy/web` and `cdeploy/web` are the
+corresponding short forms.
 
 Both commands use the current kubeconfig context and namespace, report
 progress, and wait for completion. Checkpoints live in Kubernetes, so rerun the

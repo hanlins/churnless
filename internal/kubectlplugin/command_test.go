@@ -89,8 +89,8 @@ func TestHandoffCommandUsesNamespaceAndDriver(t *testing.T) {
 		nil,
 	)
 	command.SetArgs([]string{
-		"handoff",
-		"deployment/" + commandTestWorkload,
+		handoffCommand,
+		churnlessDeploymentResource + "/" + commandTestWorkload,
 		"--namespace",
 		commandTestNamespace,
 		"--timeout=0",
@@ -187,28 +187,112 @@ func TestRestartCommandReportsOnlySuccess(t *testing.T) {
 	}
 }
 
-func TestDeploymentName(t *testing.T) {
+func TestTransferDeploymentName(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []string{
-		"deployment", "deployments", "deploy",
-		"deployment.apps", "deployments.apps",
-		"deployment.churnless.io", "deployments.churnless.io", "cdeploy",
-	} {
-		resource := kind + "/" + commandTestWorkload
-		name, err := deploymentName(resource)
+	nativeAliases := []string{
+		deploymentResource, "deployments", "deploy",
+		nativeDeploymentResource, "deployments.apps",
+	}
+	churnlessAliases := []string{
+		"cdeploy", churnlessDeploymentResource, "deployments.churnless.io",
+	}
+	tests := []struct {
+		name         string
+		destination  controller.MigrationDestination
+		accepted     []string
+		rejected     []string
+		expectedHint string
+	}{
+		{
+			name:         takeoverCommand,
+			destination:  controller.MigrationDestinationChurnless,
+			accepted:     nativeAliases,
+			rejected:     churnlessAliases,
+			expectedHint: "native Deployment source (" + nativeDeploymentResource + "/NAME)",
+		},
+		{
+			name:         handoffCommand,
+			destination:  controller.MigrationDestinationNative,
+			accepted:     churnlessAliases,
+			rejected:     nativeAliases,
+			expectedHint: "Churnless Deployment source (" + churnlessDeploymentResource + "/NAME)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, kind := range tt.accepted {
+				resource := kind + "/" + commandTestWorkload
+				name, err := transferDeploymentName(resource, tt.destination)
+				if err != nil {
+					t.Fatalf("transferDeploymentName(%q): %v", resource, err)
+				}
+				if name != commandTestWorkload {
+					t.Fatalf("transferDeploymentName(%q) = %q", resource, name)
+				}
+			}
+			for _, kind := range tt.rejected {
+				resource := kind + "/" + commandTestWorkload
+				_, err := transferDeploymentName(resource, tt.destination)
+				if err == nil {
+					t.Fatalf("transferDeploymentName(%q) succeeded", resource)
+				}
+				if !strings.Contains(err.Error(), tt.expectedHint) {
+					t.Fatalf("transferDeploymentName(%q) error = %q", resource, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTransferCommandUsageNamesSourceAPI(t *testing.T) {
+	t.Parallel()
+
+	command := newCommand(
+		genericclioptions.IOStreams{},
+		genericclioptions.NewConfigFlags(true),
+		nil,
+		nil,
+	)
+	tests := map[string]struct {
+		use     string
+		example string
+	}{
+		takeoverCommand: {
+			use:     takeoverCommand + " " + nativeDeploymentResource + "/NAME",
+			example: "kubectl churnless " + takeoverCommand + " " + nativeDeploymentResource + "/web",
+		},
+		handoffCommand: {
+			use:     handoffCommand + " " + churnlessDeploymentResource + "/NAME",
+			example: "kubectl churnless " + handoffCommand + " " + churnlessDeploymentResource + "/web",
+		},
+	}
+	for name, want := range tests {
+		subcommand, _, err := command.Find([]string{name})
 		if err != nil {
-			t.Fatalf("deploymentName(%q): %v", resource, err)
+			t.Fatal(err)
 		}
-		if name != commandTestWorkload {
-			t.Fatalf("deploymentName(%q) = %q", resource, name)
+		if subcommand.Use != want.use {
+			t.Errorf("%s Use = %q, want %q", name, subcommand.Use, want.use)
+		}
+		if !strings.Contains(subcommand.Example, want.example) {
+			t.Errorf("%s Example = %q, want %q", name, subcommand.Example, want.example)
 		}
 	}
+}
+
+func TestParseDeploymentReferenceRejectsInvalidResources(t *testing.T) {
+	t.Parallel()
+
 	for _, resource := range []string{
-		commandTestWorkload, "pod/" + commandTestWorkload, "deployment/", "deployment/a/b",
+		commandTestWorkload,
+		"pod/" + commandTestWorkload,
+		deploymentResource + "/",
+		deploymentResource + "/a/b",
 	} {
-		if _, err := deploymentName(resource); err == nil {
-			t.Fatalf("deploymentName(%q) succeeded", resource)
+		if _, err := parseDeploymentReference(resource); err == nil {
+			t.Fatalf("parseDeploymentReference(%q) succeeded", resource)
 		}
 	}
 }

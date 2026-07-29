@@ -574,7 +574,7 @@ spec:
 				"kubectl",
 				"churnless",
 				"takeover",
-				"deployment/"+workload,
+				"deployment.apps/"+workload,
 				"--timeout=5m",
 			))
 			Expect(err).NotTo(HaveOccurred())
@@ -639,7 +639,7 @@ spec:
 				"kubectl",
 				"churnless",
 				"handoff",
-				"deployment/"+workload,
+				"deployment.churnless.io/"+workload,
 				"--timeout=5m",
 			))
 			Expect(err).NotTo(HaveOccurred())
@@ -688,7 +688,7 @@ spec:
 				"kubectl",
 				"churnless",
 				"handoff",
-				"deployment/"+recoveryWorkload,
+				"deployment.churnless.io/"+recoveryWorkload,
 				"--timeout=5m",
 			))
 			Expect(err).NotTo(HaveOccurred())

@@ -269,9 +269,12 @@ identity preservation.
 The public transfer surface is the kubectl plugin:
 
 ```sh
-kubectl churnless takeover deployment/web
-kubectl churnless handoff deployment/web
+kubectl churnless takeover deployment.apps/web
+kubectl churnless handoff deployment.churnless.io/web
 ```
+
+The argument names the source API; `deploy/web` and `cdeploy/web` are the
+corresponding short forms.
 
 Each command records durable desired-controller state, repeatedly steps the
 reusable engine through an uncached API client, reports progress, and waits

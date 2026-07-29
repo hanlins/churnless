@@ -34,7 +34,27 @@ import (
 	"github.com/hanlins/churnless/internal/controller"
 )
 
-const defaultTransferTimeout = 5 * time.Minute
+const (
+	defaultTransferTimeout      = 5 * time.Minute
+	takeoverCommand             = "takeover"
+	handoffCommand              = "handoff"
+	deploymentResource          = "deployment"
+	nativeDeploymentResource    = "deployment.apps"
+	churnlessDeploymentResource = "deployment.churnless.io"
+)
+
+type deploymentAPI int
+
+const (
+	deploymentAPIAny deploymentAPI = iota
+	deploymentAPINative
+	deploymentAPIChurnless
+)
+
+type deploymentReference struct {
+	name string
+	api  deploymentAPI
+}
 
 type transferred interface {
 	Transfer(context.Context, types.NamespacedName, controller.MigrationDestination) error
@@ -61,12 +81,12 @@ func newCommand(
 	configFlags.AddFlags(command.PersistentFlags())
 	command.AddCommand(
 		newTransferCommand(
-			streams, configFlags, transferFactory, "takeover",
+			streams, configFlags, transferFactory, takeoverCommand,
 			"Transfer a native Deployment to Churnless",
 			controller.MigrationDestinationChurnless,
 		),
 		newTransferCommand(
-			streams, configFlags, transferFactory, "handoff",
+			streams, configFlags, transferFactory, handoffCommand,
 			"Transfer a Churnless Deployment to native Kubernetes",
 			controller.MigrationDestinationNative,
 		),
@@ -82,13 +102,17 @@ func newTransferCommand(
 	destination controller.MigrationDestination,
 ) *cobra.Command {
 	timeout := defaultTransferTimeout
+	source := nativeDeploymentResource
+	if destination == controller.MigrationDestinationNative {
+		source = churnlessDeploymentResource
+	}
 	command := &cobra.Command{
-		Use:     name + " deployment/NAME",
+		Use:     name + " " + source + "/NAME",
 		Short:   short,
-		Example: "  kubectl churnless " + name + " deployment/web",
+		Example: "  kubectl churnless " + name + " " + source + "/web",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			workload, err := deploymentName(args[0])
+			workload, err := transferDeploymentName(args[0], destination)
 			if err != nil {
 				return err
 			}
@@ -96,7 +120,7 @@ func newTransferCommand(
 			if err != nil {
 				return err
 			}
-			resource := "deployment/" + workload
+			resource := deploymentResource + "/" + workload
 			driver, err := factory(config, func(progress controller.MigrationProgress) {
 				_, _ = fmt.Fprintf(streams.Out, "%s: %s\n", resource, progress.Message)
 			})
@@ -137,21 +161,52 @@ func commandTarget(configFlags *genericclioptions.ConfigFlags) (string, *rest.Co
 	return namespace, config, nil
 }
 
-func deploymentName(resource string) (string, error) {
-	kind, name, found := strings.Cut(resource, "/")
-	if !found || name == "" || strings.Contains(name, "/") {
-		return "", fmt.Errorf("expected deployment/NAME, got %q", resource)
+func transferDeploymentName(
+	resource string,
+	destination controller.MigrationDestination,
+) (string, error) {
+	reference, err := parseDeploymentReference(resource)
+	if err != nil {
+		return "", err
 	}
 
-	switch kind {
-	case "deployment", "deployments", "deploy",
-		"deployment.apps", "deployments.apps",
-		"deployment.churnless.io", "deployments.churnless.io",
-		"cdeploy":
-		return name, nil
-	default:
-		return "", fmt.Errorf("only Deployment migration is supported, got %q", kind)
+	expectedSource := "native Deployment source (" + nativeDeploymentResource + "/NAME)"
+	valid := reference.api == deploymentAPINative || reference.api == deploymentAPIAny
+	if destination == controller.MigrationDestinationNative {
+		expectedSource = "Churnless Deployment source (" + churnlessDeploymentResource + "/NAME)"
+		valid = reference.api == deploymentAPIChurnless
 	}
+	if !valid {
+		return "", fmt.Errorf("expected a %s, got %q", expectedSource, resource)
+	}
+	return reference.name, nil
+}
+
+func parseDeploymentReference(resource string) (deploymentReference, error) {
+	kind, name, found := strings.Cut(resource, "/")
+	if !found || name == "" || strings.Contains(name, "/") {
+		return deploymentReference{}, fmt.Errorf(
+			"expected %s/NAME, got %q",
+			deploymentResource,
+			resource,
+		)
+	}
+
+	var api deploymentAPI
+	switch strings.ToLower(kind) {
+	case deploymentResource, "deployments":
+		api = deploymentAPIAny
+	case "deploy", nativeDeploymentResource, "deployments.apps":
+		api = deploymentAPINative
+	case "cdeploy", churnlessDeploymentResource, "deployments.churnless.io":
+		api = deploymentAPIChurnless
+	default:
+		return deploymentReference{}, fmt.Errorf(
+			"only Deployment resources are supported, got %q",
+			kind,
+		)
+	}
+	return deploymentReference{name: name, api: api}, nil
 }
 
 func newTransferer(

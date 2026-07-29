@@ -59,7 +59,6 @@ const (
 	migrationModeRecovery         = "recovery"
 	migrationRoleSource           = "source"
 	migrationStateVersion         = "1"
-	annotationEnabledValue        = "true"
 
 	sourceDeletionCost = "2147483647"
 	targetDeletionCost = "-2147483647"
@@ -349,10 +348,8 @@ func (r *DeploymentMigrationEngine) advanceTakeover(
 	}
 	changed, err = r.prepareMigration(
 		ctx,
-		string(source.UID),
-		source.Namespace,
+		source,
 		asClientObjects(sourceReplicaSets),
-		uidSetFor(sourceReplicaSets),
 		targetReplicaSet.Spec.Selector,
 		targetReplicaSet.UID,
 	)
@@ -450,11 +447,7 @@ func (r *DeploymentMigrationEngine) cancelMigration(
 		annotations := maps.Clone(replicaSet.GetAnnotations())
 		delete(annotations, migrationIDAnnotation)
 		replicaSet.SetAnnotations(annotations)
-		if err := r.writer.Patch(
-			ctx,
-			replicaSet,
-			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-		); err != nil {
+		if err := r.patchOptimistically(ctx, replicaSet, before); err != nil {
 			return 0, fmt.Errorf(
 				"restore source ReplicaSet %s/%s: %w",
 				replicaSet.GetNamespace(),
@@ -508,10 +501,7 @@ func (r *DeploymentMigrationEngine) restoreCancelledMigrationPod(
 	addedPodLabel string,
 ) error {
 	before := pod.DeepCopy()
-	restorePodTemplateLabel(pod, sourceTemplate, addedPodLabel)
-	delete(pod.Annotations, migrationIDAnnotation)
-	delete(pod.Annotations, migrationRoleAnnotation)
-	if err := restoreMigrationDeletionCost(pod); err != nil {
+	if err := restoreMigrationPod(pod, sourceTemplate, addedPodLabel); err != nil {
 		return fmt.Errorf(
 			"restore source Pod %s/%s deletion cost: %w",
 			pod.Namespace,
@@ -519,17 +509,7 @@ func (r *DeploymentMigrationEngine) restoreCancelledMigrationPod(
 			err,
 		)
 	}
-	if len(pod.Annotations) == 0 {
-		pod.Annotations = nil
-	}
-	if len(pod.Labels) == 0 {
-		pod.Labels = nil
-	}
-	if err := r.writer.Patch(
-		ctx,
-		pod,
-		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-	); err != nil {
+	if err := r.patchOptimistically(ctx, pod, before); err != nil {
 		return fmt.Errorf("restore source Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	return nil
@@ -601,10 +581,8 @@ func (r *DeploymentMigrationEngine) advanceHandoff(
 	}
 	changed, err = r.prepareMigration(
 		ctx,
-		string(source.UID),
-		source.Namespace,
+		source,
 		asClientObjects(sourceReplicaSets),
-		uidSetFor(sourceReplicaSets),
 		targetReplicaSet.Spec.Selector,
 		targetReplicaSet.UID,
 	)
@@ -816,28 +794,21 @@ func validateMigrationTarget(
 
 func (r *DeploymentMigrationEngine) prepareMigration(
 	ctx context.Context,
-	migrationID string,
-	namespace string,
+	source client.Object,
 	sourceReplicaSets []client.Object,
-	sourceReplicaSetUIDs map[types.UID]struct{},
 	targetSelector *metav1.LabelSelector,
 	targetReplicaSetUID types.UID,
 ) (bool, error) {
+	migrationID := string(source.GetUID())
 	for _, replicaSet := range sourceReplicaSets {
 		if replicaSet.GetAnnotations()[migrationIDAnnotation] == migrationID {
 			continue
 		}
-		before := replicaSet.DeepCopyObject().(client.Object)
-		annotations := maps.Clone(replicaSet.GetAnnotations())
-		if annotations == nil {
-			annotations = map[string]string{}
-		}
-		annotations[migrationIDAnnotation] = migrationID
-		replicaSet.SetAnnotations(annotations)
-		if err := r.writer.Patch(
+		if err := r.setAnnotation(
 			ctx,
 			replicaSet,
-			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+			migrationIDAnnotation,
+			migrationID,
 		); err != nil {
 			return false, fmt.Errorf("mark source ReplicaSet %s: %w", replicaSet.GetName(), err)
 		}
@@ -848,11 +819,11 @@ func (r *DeploymentMigrationEngine) prepareMigration(
 	if err != nil {
 		return false, fmt.Errorf("parse target ReplicaSet selector: %w", err)
 	}
-	pods, err := r.listPods(ctx, namespace)
+	pods, err := r.listPods(ctx, source.GetNamespace())
 	if err != nil {
 		return false, err
 	}
-	sourcePods := podsControlledBy(pods, sourceReplicaSetUIDs)
+	sourcePods := podsControlledBy(pods, uidSetFor(sourceReplicaSets))
 	targetPods := podsControlledBy(pods, map[types.UID]struct{}{targetReplicaSetUID: {}})
 	for i := range sourcePods {
 		changed, err := r.preparePod(
@@ -958,11 +929,7 @@ func (r *DeploymentMigrationEngine) preparePod(
 		maps.Equal(before.Annotations, pod.Annotations) {
 		return false, nil
 	}
-	if err := r.writer.Patch(
-		ctx,
-		pod,
-		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-	); err != nil {
+	if err := r.patchOptimistically(ctx, pod, before); err != nil {
 		return false, fmt.Errorf("prepare Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	return true, nil
@@ -1001,7 +968,6 @@ func (r *DeploymentMigrationEngine) finishTakeover(
 		replicaSets:        churnlessPodAdoptionTargets(replicaSets),
 		template:           &target.Spec.Template,
 		takeover:           true,
-		returning:          returningToNative,
 		deploymentComplete: complete,
 	})
 }
@@ -1056,7 +1022,6 @@ func (r *DeploymentMigrationEngine) finishHandoff(
 		migrationID:        migrationID,
 		replicaSets:        nativePodAdoptionTargets(replicaSets),
 		template:           &target.Spec.Template,
-		returning:          returningToChurnless,
 		deploymentComplete: returningToChurnless || nativeDeploymentComplete(target),
 	})
 }
@@ -1067,7 +1032,6 @@ type migrationFinish struct {
 	replicaSets        []podAdoptionTarget
 	template           *corev1.PodTemplateSpec
 	takeover           bool
-	returning          bool
 	deploymentComplete bool
 }
 
@@ -1182,11 +1146,7 @@ func (r *DeploymentMigrationEngine) adoptMigrationPods(
 		if err := controllerutil.SetControllerReference(freshTarget, pod, r.scheme); err != nil {
 			return false, fmt.Errorf("adopt Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
-		if err := r.writer.Patch(
-			ctx,
-			pod,
-			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-		); err != nil {
+		if err := r.patchOptimistically(ctx, pod, before); err != nil {
 			return false, fmt.Errorf("adopt Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 		return true, nil
@@ -1266,9 +1226,22 @@ func (r *DeploymentMigrationEngine) cleanupMigrationPods(
 			continue
 		}
 		before := pod.DeepCopy()
-		delete(pod.Annotations, migrationIDAnnotation)
-		delete(pod.Annotations, migrationRoleAnnotation)
-		if err := restoreMigrationDeletionCost(pod); err != nil {
+		templateLabel := appsv1.DefaultDeploymentUniqueLabelKey
+		var extraAnnotations []string
+		if !takeover {
+			templateLabel = structuralRevisionLabel
+			extraAnnotations = []string{
+				revisionAnnotation,
+				managedLabelKeysAnnotation,
+				managedAnnotationKeysAnnotation,
+			}
+		}
+		if err := restoreMigrationPod(
+			pod,
+			template,
+			templateLabel,
+			extraAnnotations...,
+		); err != nil {
 			return false, false, fmt.Errorf(
 				"restore Pod %s/%s deletion cost: %w",
 				pod.Namespace,
@@ -1276,34 +1249,36 @@ func (r *DeploymentMigrationEngine) cleanupMigrationPods(
 				err,
 			)
 		}
-		if takeover {
-			restorePodTemplateLabel(
-				pod,
-				template,
-				appsv1.DefaultDeploymentUniqueLabelKey,
-			)
-		} else {
-			restorePodTemplateLabel(pod, template, structuralRevisionLabel)
-			delete(pod.Annotations, revisionAnnotation)
-			delete(pod.Annotations, managedLabelKeysAnnotation)
-			delete(pod.Annotations, managedAnnotationKeysAnnotation)
-		}
-		if len(pod.Annotations) == 0 {
-			pod.Annotations = nil
-		}
-		if len(pod.Labels) == 0 {
-			pod.Labels = nil
-		}
-		if err := r.writer.Patch(
-			ctx,
-			pod,
-			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-		); err != nil {
+		if err := r.patchOptimistically(ctx, pod, before); err != nil {
 			return false, false, fmt.Errorf("clean up Pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 		return true, true, nil
 	}
 	return true, false, nil
+}
+
+func restoreMigrationPod(
+	pod *corev1.Pod,
+	template *corev1.PodTemplateSpec,
+	templateLabel string,
+	extraAnnotations ...string,
+) error {
+	restorePodTemplateLabel(pod, template, templateLabel)
+	delete(pod.Annotations, migrationIDAnnotation)
+	delete(pod.Annotations, migrationRoleAnnotation)
+	if err := restoreMigrationDeletionCost(pod); err != nil {
+		return err
+	}
+	for _, annotation := range extraAnnotations {
+		delete(pod.Annotations, annotation)
+	}
+	if len(pod.Annotations) == 0 {
+		pod.Annotations = nil
+	}
+	if len(pod.Labels) == 0 {
+		pod.Labels = nil
+	}
+	return nil
 }
 
 func restorePodTemplateLabel(
@@ -1385,11 +1360,7 @@ func (r *DeploymentMigrationEngine) finishMigrationTarget(
 	default:
 		return fmt.Errorf("unsupported migration target %T", target)
 	}
-	if err := r.writer.Patch(
-		ctx,
-		target,
-		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
-	); err != nil {
+	if err := r.patchOptimistically(ctx, target, before); err != nil {
 		return fmt.Errorf("finish migration target: %w", err)
 	}
 	return nil
@@ -1424,6 +1395,13 @@ func (r *DeploymentMigrationEngine) setAnnotation(
 	}
 	annotations[key] = value
 	object.SetAnnotations(annotations)
+	return r.patchOptimistically(ctx, object, before)
+}
+
+func (r *DeploymentMigrationEngine) patchOptimistically(
+	ctx context.Context,
+	object, before client.Object,
+) error {
 	return r.writer.Patch(
 		ctx,
 		object,

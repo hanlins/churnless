@@ -188,6 +188,71 @@ For scripts, use fully qualified resource names such as
 HPA can target the Churnless GVK directly through its standard `/scale`
 subresource.
 
+## Explore an existing Deployment and fall back
+
+Build, install, and verify the kubectl plugin from a checkout:
+
+```sh
+make install-plugin
+# If prompted, run the printed PATH export first.
+kubectl churnless --help
+```
+
+If Go's bin directory is not on `PATH`, the install target prints the exact
+export to run. It does not edit shell startup files.
+
+Before starting, wait for the native Deployment to finish its rollout and
+pause automation that could recreate the source GVK or revert dependent
+references. Optionally record current Pod identity:
+
+```sh
+kubectl rollout status deployment.apps/web
+kubectl get pods -l app=web \
+  -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,IP:.status.podIP'
+```
+
+Move the workload to Churnless, then return it to native Kubernetes when
+needed:
+
+```sh
+kubectl churnless takeover deployment.apps/web
+kubectl churnless handoff deployment.churnless.io/web
+```
+
+The argument names the source API; `deploy/web` and `cdeploy/web` are the
+corresponding short forms.
+
+Both commands use the current kubeconfig context and namespace, report
+progress, and wait for completion. Checkpoints live in Kubernetes, so rerun the
+same command after an interruption or run the opposite command to reverse an
+in-progress transfer.
+
+Takeover requires a complete native rollout and a healthy Churnless manager.
+Healthy handoff preserves ready Pod name, UID, and IP when Kubernetes permits
+it and remains available while the Churnless manager and admission server are
+down. An incomplete Churnless rollout instead uses recovery handoff: native
+controllers warm the destination and the old Pods are replaced without waiting
+for Churnless to recover.
+
+The caller needs read/write access to both Deployment GVKs, their ReplicaSets
+and Pods, and supported autoscaler references. During a transfer, keep the
+source spec unchanged and do not create the same-name target GVK manually.
+Temporary target Pods can briefly increase Pod and resource counts.
+
+The engine retargets HorizontalPodAutoscaler, VerticalPodAutoscaler, and KEDA
+ScaledObject references. Selector-based Services and PodDisruptionBudgets keep
+matching the same labels; review other custom workload references separately.
+
+Inspect current objects with:
+
+```sh
+kubectl get deployment.apps/web deployment.churnless.io/web --ignore-not-found
+```
+
+Migration currently supports Deployments only. See
+[DESIGN.md](DESIGN.md#takeover-and-handoff) for its ownership protocol,
+cancellation semantics, persisted state, and failure boundaries.
+
 ## Design
 
 See [DESIGN.md](DESIGN.md) for the compatibility contract, controller

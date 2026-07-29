@@ -60,6 +60,7 @@ object has exactly one authoritative controller:
 | --- | --- |
 | Churnless Deployment | Chooses structural revisions, creates and scales Churnless ReplicaSets, applies rollout strategy, and aggregates status. |
 | Churnless ReplicaSet | Selects and adopts Pods, maintains replica count, creates and deletes Pods, applies supported Pod metadata, image, and resource changes in place, and reports status. |
+| Migration engine | Transfers a stable Deployment and its live Pods between native Kubernetes and Churnless ownership chains when driven by the kubectl plugin. |
 | Admission webhooks | Apply and validate the native workload semantics that CRD schemas do not inherit from built-in API storage. |
 | kubelet | Observes patched images and resource resize requests, then restarts or resizes affected containers as required. |
 
@@ -142,6 +143,14 @@ but avoids maintaining a partial fork of workload admission behavior.
 Server-side dry-run tests compare selected Churnless admission behavior with
 the native GVK. The native API server is a test oracle, not a runtime
 dependency and not a shadow controller.
+
+The Deployment and ReplicaSet webhooks run for creates and spec-changing
+updates. Metadata-only updates are excluded with admission `matchConditions`
+because the current defaulting and validation contracts operate only on
+`spec`. This keeps desired-state changes fail-closed while allowing Kubernetes
+metadata, including migration annotations and owner bookkeeping, to remain
+writable if the Churnless admission server is unavailable. Adding any future
+webhook behavior for metadata requires revisiting this condition.
 
 ## Revision model
 
@@ -255,6 +264,119 @@ Scaling and self-healing always create Pods from the latest ReplicaSet
 template. Those operations may create a new Pod and therefore do not promise
 identity preservation.
 
+## Takeover and handoff
+
+The public transfer surface is the kubectl plugin:
+
+```sh
+kubectl churnless takeover deployment.apps/web
+kubectl churnless handoff deployment.churnless.io/web
+```
+
+The argument names the source API; `deploy/web` and `cdeploy/web` are the
+corresponding short forms.
+
+Each command records durable desired-controller state, repeatedly steps the
+reusable engine through an uncached API client, reports progress, and waits
+for completion. Migration state lives in Kubernetes rather
+than a local checkpoint, so interruption or timeout is safe: rerunning the same
+command resumes the operation. Optimistic patches and UID/resource-version
+delete preconditions make retries safe.
+
+There is intentionally no continuously running migration controller in the
+baseline architecture. Raw transfer annotations are internal checkpoints, not
+independent triggers. This makes emergency handoff depend only on the plugin
+binary, API server, and native controllers. The engine keeps a
+controller-neutral `Request`/`Advance` boundary so a future optional
+controller can be a thin scheduling adapter without duplicating cutover logic.
+
+If another plugin invocation requests the opposite controller, an older
+synchronous command reports that it was superseded and stops driving instead
+of overwriting the newer intent. A same-name target Deployment must not already
+exist outside valid transfer state, and migration does not start from a source
+that is already deleting.
+
+Takeover requires a complete, stable native rollout because its normal purpose
+is an identity-preserving move from a known-good baseline.
+
+Handoff is always allowed to start. The engine creates the target under the
+other GVK with the source spec, labels, and non-migration annotations. It
+records the source UID, generation, original paused state, and `preserve` or
+`recovery` mode on the target; the target GVK identifies the direction. A
+source spec change during migration blocks cutover so two
+different desired states cannot be silently combined.
+
+Cancellation is symmetric while the source still exists and is not deleting:
+running the opposite plugin command restores dependent references and source
+migration metadata before removing the target, keeping the source controller
+authoritative.
+
+Before cutover, the target creates its ReplicaSet and temporary Pods. The
+engine then:
+
+1. Retargets supported GVK-specific dependents to the target Deployment.
+2. Adds the target ReplicaSet's required labels to the live source Pods.
+3. Gives source Pods a higher deletion preference than temporary target Pods.
+4. Orphan-deletes the source Deployment and its ReplicaSets.
+5. Explicitly adopts the now-unowned source Pods into the target ReplicaSet.
+6. Waits for the target rollout to settle, removes temporary migration
+   metadata, and restores the source's original paused state on the target.
+
+This ordering keeps the source authoritative until the target ownership chain
+is ready and normally retains each ready source Pod's name, UID, and IP.
+Retention remains best effort: eviction, deletion, node failure, or another
+controller acting during cutover can still replace a Pod. Temporary target
+Pods also mean Pod objects and resource requests can briefly exceed the
+Deployment replica count, although pending or less-ready temporary Pods are
+preferred for deletion after adoption.
+
+If the desired controller changes after source deletion has already started,
+the current transfer can no longer be cancelled safely. The engine copies
+the new request to the surviving target, finishes the current ownership
+bookkeeping, and immediately starts the reverse transfer. In particular, a
+native fallback requested during takeover does not wait for a newly unhealthy
+Churnless rollout before starting recovery.
+
+If handoff starts while the Churnless source is incomplete, the recorded mode
+is `recovery`. The native Deployment and current native ReplicaSet are allowed
+to create their desired Pod count, but source Pods are not relabeled or
+adopted. After dependents point to the native GVK, the engine
+foreground-deletes the Churnless hierarchy and lets garbage collection remove
+its Pods before declaring migration complete. Recovery does not wait for
+native Pods to become Ready: the goal is to restore native desired-state
+ownership even when the copied workload spec is itself unhealthy. Pod identity
+is not preserved in this mode. A preserve-mode handoff also switches to
+recovery if the Churnless source becomes incomplete before cutover, so fallback
+cannot remain stuck waiting on the controller it is intended to replace. The
+plugin reports progress from persisted state and does not require Event-create
+permission.
+
+Emergency handoff works while the entire Churnless manager is down:
+metadata-only updates bypass its webhooks and native controllers warm the
+destination. The preserve and recovery rules above still apply. Takeover
+requires healthy Churnless admission, Deployment, and ReplicaSet controllers.
+
+Migration currently covers Deployments, not standalone ReplicaSets. The
+engine rewrites these namespaced workload references when they point to
+the same-name source Deployment:
+
+- `autoscaling/v2` HorizontalPodAutoscaler `spec.scaleTargetRef`
+- `autoscaling.k8s.io/v1` VerticalPodAutoscaler `spec.targetRef`
+- `keda.sh/v1alpha1` ScaledObject `spec.scaleTargetRef`
+
+KEDA's omitted `apiVersion` and `kind` defaults are interpreted as
+`apps/v1 Deployment`. Each patch is idempotent and matches the source
+`apiVersion`, kind, and name before changing the `apiVersion`. KEDA is handled
+before HPA so its generated HPA follows the same target. A missing optional VPA
+or KEDA API is ignored, while an installed API that cannot be listed or patched
+blocks cutover instead of leaving a stale target.
+
+Services, selector-based PodDisruptionBudgets, and other selector-based
+resources continue to select Pods by label throughout the transfer and do not
+need a GVK rewrite. Arbitrary custom-resource reference fields cannot be
+discovered safely; policy or automation outside the supported references above
+must be reviewed separately.
+
 ## Reconciliation invariants
 
 Every controller change must preserve these invariants:
@@ -267,8 +389,30 @@ Every controller change must preserve these invariants:
 - Explicit redeploy tokens always use a distinct ReplicaSet identity.
 - A replacement Pod starts with the latest desired in-place revision.
 - Reconciliation is idempotent and safe after partial progress or restart.
+- Deleting Churnless Deployments and ReplicaSets never create or update
+  dependents, allowing foreground recovery handoff to terminate the hierarchy.
 - Pod adoption re-reads the ReplicaSet from the API server and verifies its UID
   and deletion state before taking ownership.
+- Identity-preserving migration never orphan-deletes the source hierarchy until the
+  supported dependent references point to the target GVK, the target ReplicaSet
+  exists, and every observed source Pod matches its selector.
+- Recovery handoff never foreground-deletes the Churnless hierarchy until
+  supported dependents point to the native GVK and the native ReplicaSet has
+  created its desired Pod count.
+- Migration state is recoverable from the target Deployment and source
+  ReplicaSet annotations after plugin interruption.
+- Durable migration state has an explicit version and fails closed on an
+  unknown version, mode, or desired-controller value before ownership is
+  orphaned. The engine live-reads both Deployments again immediately before
+  source deletion, whose UID and resource-version preconditions close a racing
+  reversal.
+- Per-Pod deletion cost is recorded before migration preference is applied and
+  restored exactly after completion or cancellation.
+- The kubectl driver owns scheduling while the reusable migration engine owns
+  all transfer semantics; a future controller must adapt that engine rather
+  than implement a second cutover path.
+- The baseline manager does not watch transfer annotations or receive
+  transfer-only Deployment, autoscaler, KEDA, VPA, or Event permissions.
 - Replica-count decisions use uncached reads so a fast requeue cannot create
   another batch from stale informer state.
 - ReplicaSet Pod discovery combines a live selector-scoped list with a cached
@@ -283,8 +427,8 @@ Every controller change must preserve these invariants:
 Internal labels and annotations under `churnless.io/` must not become the only
 source of ownership; Kubernetes controller owner references remain
 authoritative. The documented `in-place-resources` and `redeploy-at`
-annotations are public rollout controls; other keys in that namespace remain
-controller implementation details.
+annotations are public controls. Transfer annotations, including
+`churnless.io/controller`, are plugin-managed implementation details.
 
 ## Compatibility boundary
 
@@ -329,6 +473,13 @@ The acceptance suite must continue to verify:
   Recreate never runs old and new revisions at the same time.
 - `/scale` changes replica count and newly created Pods use the latest image.
 - `/scale` exposes the selector string and a real HPA can change replicas.
+- Plugin takeover and manager-down healthy handoff preserve Pod name, UID, IP,
+  and the exact Deployment/ReplicaSet ownership chain while a real HPA follows
+  both directions; metadata updates remain available and spec changes remain
+  fail-closed during the outage.
+- With the manager still scaled to zero, the plugin can also return an
+  incomplete Churnless rollout to native ownership without waiting for
+  Churnless completion; this recovery path intentionally replaces Pods.
 - Deployment and ReplicaSet defaults, plus critical invalid-selector behavior,
   match their native GVKs under server-side dry-run.
 

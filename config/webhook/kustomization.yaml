@@ -1,3 +1,7 @@
 resources:
 - manifests.yaml
 - service.yaml
+
+patches:
+- path: patches/mutating_webhook_metadata_updates.yaml
+- path: patches/validating_webhook_metadata_updates.yaml

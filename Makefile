@@ -30,6 +30,9 @@ BENCHMARK_NEW_IMAGE ?= registry.k8s.io/pause:3.10
 
 # Build local tools with the same Go toolchain used by this module.
 PROJECT_GO_TOOLCHAIN ?= $(shell go env GOVERSION)
+PLUGIN_BIN ?= $(LOCALBIN)/kubectl-churnless
+PLUGIN_INSTALL_DIR ?= $(GOBIN)
+PLUGIN_CGO_ENABLED ?= 0
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -102,7 +105,8 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(E2E_KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+	$(MAKE) install-plugin PLUGIN_INSTALL_DIR="$(LOCALBIN)"
+	PATH="$(LOCALBIN):$$PATH" KIND=$(KIND) KIND_CLUSTER=$(E2E_KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
@@ -189,6 +193,26 @@ kind-down: ## Delete the local Kind playground cluster.
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
+
+.PHONY: build-plugin
+build-plugin: $(LOCALBIN) ## Build the kubectl-churnless plugin.
+	CGO_ENABLED="$(PLUGIN_CGO_ENABLED)" go build -trimpath -o "$(PLUGIN_BIN)" ./cmd/kubectl-churnless
+
+.PHONY: install-plugin
+install-plugin: ## Install and verify kubectl-churnless discovery.
+	mkdir -p "$(PLUGIN_INSTALL_DIR)"
+	CGO_ENABLED="$(PLUGIN_CGO_ENABLED)" GOBIN="$(PLUGIN_INSTALL_DIR)" \
+		go install -trimpath ./cmd/kubectl-churnless
+	@command -v "$(KUBECTL)" >/dev/null 2>&1 || { \
+		echo "$(KUBECTL) is required to use the installed plugin."; \
+		exit 1; \
+	}
+	@PATH="$(PLUGIN_INSTALL_DIR):$$PATH" "$(KUBECTL)" churnless --help >/dev/null
+	@echo "Installed and verified $(PLUGIN_INSTALL_DIR)/kubectl-churnless"
+	@case ":$$PATH:" in \
+		*":$(PLUGIN_INSTALL_DIR):"*) ;; \
+		*) echo 'Add it to this shell with: export PATH="$(PLUGIN_INSTALL_DIR):$$PATH"' ;; \
+	esac
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.

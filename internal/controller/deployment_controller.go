@@ -67,6 +67,9 @@ func (r *DeploymentReconciler) Reconcile(
 	if err := r.Get(ctx, req.NamespacedName, &workload); err != nil {
 		return ignoreNotFound(err)
 	}
+	if !workload.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
 	if workload.Spec.Replicas == nil {
 		before := workload.DeepCopy()
 		replicas := int32(1)

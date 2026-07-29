@@ -52,6 +52,42 @@ var _ = Describe("ReplicaSet Controller", func() {
 		)
 	})
 
+	It("does not create Pods while the ReplicaSet is deleting", func() {
+		replicas := int32(1)
+		workload := &appsv1alpha1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       name,
+				Namespace:  namespace,
+				Finalizers: []string{"test.churnless.io/hold-deletion"},
+			},
+			Spec: appsv1alpha1.ReplicaSetSpec{ReplicaSetSpec: appsv1.ReplicaSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{appLabel: name}},
+				Template: podTemplate(name, oldImage),
+			}},
+		}
+		Expect(k8sClient.Create(ctx, workload)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, workload)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, workload)).To(Succeed())
+		Expect(workload.DeletionTimestamp.IsZero()).To(BeFalse())
+		reconciler := &ReplicaSetReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		var pods corev1.PodList
+		Expect(k8sClient.List(
+			ctx,
+			&pods,
+			client.InNamespace(namespace),
+			client.MatchingLabels{appLabel: name},
+		)).To(Succeed())
+		Expect(pods.Items).To(BeEmpty())
+
+		Expect(k8sClient.Get(ctx, key, workload)).To(Succeed())
+		workload.Finalizers = nil
+		Expect(k8sClient.Update(ctx, workload)).To(Succeed())
+	})
+
 	It("owns Pods directly and applies image changes in place", func() {
 		replicas := int32(1)
 		workload := &appsv1alpha1.ReplicaSet{

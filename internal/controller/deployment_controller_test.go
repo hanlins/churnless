@@ -79,6 +79,30 @@ var _ = Describe("Deployment Controller", func() {
 		)
 	})
 
+	It("does not create ReplicaSets while the Deployment is deleting", func() {
+		workload := currentDeployment(ctx, key)
+		workload.Finalizers = []string{"test.churnless.io/hold-deletion"}
+		Expect(k8sClient.Update(ctx, workload)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, workload)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, workload)).To(Succeed())
+		Expect(workload.DeletionTimestamp.IsZero()).To(BeFalse())
+
+		_, err := deploymentReconciler.Reconcile(
+			ctx,
+			reconcile.Request{NamespacedName: key},
+		)
+		Expect(err).NotTo(HaveOccurred())
+		var replicaSets appsv1alpha1.ReplicaSetList
+		Expect(k8sClient.List(ctx, &replicaSets, client.InNamespace(namespace))).To(Succeed())
+		for i := range replicaSets.Items {
+			Expect(metav1.IsControlledBy(&replicaSets.Items[i], workload)).To(BeFalse())
+		}
+
+		Expect(k8sClient.Get(ctx, key, workload)).To(Succeed())
+		workload.Finalizers = nil
+		Expect(k8sClient.Update(ctx, workload)).To(Succeed())
+	})
+
 	It("keeps the same ReplicaSet and Pod identity for an image update", func() {
 		By("creating a Churnless ReplicaSet and letting it create the Pod")
 		reconcileDeployment(ctx, key, deploymentReconciler, 4)

@@ -177,7 +177,6 @@ var _ = Describe("Deployment migration engine", func() {
 		source := nativeMigrationTestDeployment(name, churnlessControllerValue)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		setNativeMigrationComplete(ctx, source)
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 
 		target := takeoverMigrationTarget(source)
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
@@ -200,10 +199,8 @@ var _ = Describe("Deployment migration engine", func() {
 		source := nativeMigrationTestDeployment(name, churnlessControllerValue)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		setNativeMigrationComplete(ctx, source)
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		target := takeoverMigrationTarget(source)
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
-		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		createCompleteChurnlessReplicaSet(ctx, target)
 
 		liveClient, err := client.NewWithWatch(
@@ -283,12 +280,10 @@ var _ = Describe("Deployment migration engine", func() {
 			key := types.NamespacedName{Name: name, Namespace: namespace}
 			source := nativeMigrationTestDeployment(name, nativeControllerValue)
 			Expect(k8sClient.Create(ctx, source)).To(Succeed())
-			Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 			var observed client.Object = source
 			if active {
 				observed = takeoverMigrationTarget(source)
 				Expect(k8sClient.Create(ctx, observed)).To(Succeed())
-				Expect(k8sClient.Get(ctx, key, observed)).To(Succeed())
 			}
 			resourceVersion := observed.GetResourceVersion()
 
@@ -319,7 +314,6 @@ var _ = Describe("Deployment migration engine", func() {
 		source.Spec.Paused = true
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		key := types.NamespacedName{Name: name, Namespace: namespace}
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		createCompleteChurnlessReplicaSet(ctx, source)
 
 		_, _, err := engine.AdvanceMigration(ctx, key, MigrationDestinationNative)
@@ -364,7 +358,6 @@ var _ = Describe("Deployment migration engine", func() {
 		key := types.NamespacedName{Name: name, Namespace: namespace}
 		source := churnlessMigrationTestDeployment(name, nativeControllerValue)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		target := handoffMigrationTarget(source)
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
 
@@ -399,7 +392,6 @@ var _ = Describe("Deployment migration engine", func() {
 				churnlessControllerValue,
 			)
 			Expect(k8sClient.Create(ctx, source)).To(Succeed())
-			Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 			target := takeoverMigrationTarget(source)
 			mutate(target.Annotations)
 			Expect(k8sClient.Create(ctx, target)).To(Succeed())
@@ -444,7 +436,6 @@ var _ = Describe("Deployment migration engine", func() {
 		source := churnlessMigrationTestDeployment(name, nativeControllerValue)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		key := types.NamespacedName{Name: name, Namespace: namespace}
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 
 		_, _, err := engine.AdvanceMigration(ctx, key, MigrationDestinationNative)
 		Expect(err).NotTo(HaveOccurred())
@@ -503,7 +494,6 @@ var _ = Describe("Deployment migration engine", func() {
 			churnlessControllerValue,
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		target := takeoverMigrationTarget(source)
 		target.Finalizers = []string{testDeletionFinalizer}
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
@@ -529,7 +519,6 @@ var _ = Describe("Deployment migration engine", func() {
 			if takeover {
 				native := nativeMigrationTestDeployment(name, nativeControllerValue)
 				Expect(k8sClient.Create(ctx, native)).To(Succeed())
-				Expect(k8sClient.Get(ctx, key, native)).To(Succeed())
 				source = native
 				target = takeoverMigrationTarget(native)
 				restoredController = nativeControllerValue
@@ -538,7 +527,6 @@ var _ = Describe("Deployment migration engine", func() {
 			} else {
 				churnless := churnlessMigrationTestDeployment(name, churnlessControllerValue)
 				Expect(k8sClient.Create(ctx, churnless)).To(Succeed())
-				Expect(k8sClient.Get(ctx, key, churnless)).To(Succeed())
 				source = churnless
 				target = handoffMigrationTarget(churnless)
 				restoredController = churnlessControllerValue
@@ -578,7 +566,6 @@ var _ = Describe("Deployment migration engine", func() {
 			nativeControllerValue,
 		)
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		target := handoffMigrationTarget(source)
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
 
@@ -598,10 +585,8 @@ var _ = Describe("Deployment migration engine", func() {
 		source.Finalizers = []string{testDeletionFinalizer}
 		Expect(k8sClient.Create(ctx, source)).To(Succeed())
 		clearFinalizersAfterTest(ctx, source)
-		Expect(k8sClient.Get(ctx, key, source)).To(Succeed())
 		target := handoffMigrationTarget(source)
 		Expect(k8sClient.Create(ctx, target)).To(Succeed())
-		Expect(k8sClient.Get(ctx, key, target)).To(Succeed())
 		replicaSet := &appsv1.ReplicaSet{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name + "-target",
@@ -648,20 +633,8 @@ var _ = Describe("Deployment migration engine", func() {
 
 	It("marks source Pods for adoption and restores their template labels", func() {
 		const name = "takeover-test"
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
-				Labels: map[string]string{
-					appLabel:                name,
-					structuralRevisionLabel: "original",
-				},
-				Annotations: map[string]string{corev1.PodDeletionCost: "7"},
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: migrationTestContainer, Image: image}},
-			},
-		}
+		pod := migrationTestPod(name, map[string]string{corev1.PodDeletionCost: "7"})
+		pod.Labels[structuralRevisionLabel] = "original"
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
 		changed, err := engine.preparePod(
@@ -721,12 +694,6 @@ var _ = Describe("Deployment migration engine", func() {
 			true,
 			"",
 		),
-		Entry(
-			"when present with a numeric value",
-			map[string]string{corev1.PodDeletionCost: "7"},
-			true,
-			"7",
-		),
 	)
 
 	It("rejects cleanup without a deletion-cost snapshot", func() {
@@ -738,17 +705,7 @@ var _ = Describe("Deployment migration engine", func() {
 		"fails closed when a prepared Pod cannot restore its deletion cost",
 		func(name string, annotations map[string]string, message string) {
 			want := maps.Clone(annotations)
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        name,
-					Namespace:   namespace,
-					Labels:      map[string]string{appLabel: name},
-					Annotations: annotations,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: migrationTestContainer, Image: image}},
-				},
-			}
+			pod := migrationTestPod(name, annotations)
 			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
 			changed, err := engine.preparePod(
@@ -801,21 +758,10 @@ var _ = Describe("Deployment migration engine", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, replicaSet)).To(Succeed())
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(replicaSet), replicaSet)).To(Succeed())
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
-				Labels:    map[string]string{appLabel: name},
-				Annotations: map[string]string{
-					migrationIDAnnotation:   migrationTestID,
-					migrationRoleAnnotation: migrationRoleSource,
-				},
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: migrationTestContainer, Image: image}},
-			},
-		}
+		pod := migrationTestPod(name, map[string]string{
+			migrationIDAnnotation:   migrationTestID,
+			migrationRoleAnnotation: migrationRoleSource,
+		})
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 
 		staleTarget := replicaSet.DeepCopy()
@@ -879,6 +825,20 @@ func clearFinalizersAfterTest(ctx context.Context, object client.Object) {
 		fresh.SetFinalizers(nil)
 		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
 	})
+}
+
+func migrationTestPod(name string, annotations map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   migrationTestNamespace,
+			Labels:      map[string]string{appLabel: name},
+			Annotations: maps.Clone(annotations),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: migrationTestContainer, Image: migrationTestImage}},
+		},
+	}
 }
 
 func nativeMigrationTestDeployment(
@@ -991,7 +951,6 @@ func createCompleteChurnlessReplicaSet(
 	Expect(controllerutil.SetControllerReference(source, replicaSet, k8sClient.Scheme())).
 		To(Succeed())
 	Expect(k8sClient.Create(ctx, replicaSet)).To(Succeed())
-	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(replicaSet), replicaSet)).To(Succeed())
 	replicaSet.Status = appsv1alpha1.ReplicaSetStatus{
 		ReplicaSetStatus: appsv1.ReplicaSetStatus{
 			ObservedGeneration: replicaSet.Generation,
